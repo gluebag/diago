@@ -107,7 +107,7 @@ type AnswerOptions struct {
 func (d *DialogServerSession) AnswerOptions(opt AnswerOptions) error {
 	d.mu.Lock()
 	d.onReferDialog = opt.OnRefer
-	d.onMediaUpdate = opt.OnMediaUpdate
+	d.OnMediaUpdate = opt.OnMediaUpdate
 	d.mu.Unlock()
 
 	// Let override of formats

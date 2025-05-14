@@ -72,7 +72,7 @@ type DialogMedia struct {
 	lastInvite *sip.Request
 
 	onClose       func() error
-	onMediaUpdate func(*DialogMedia)
+	OnMediaUpdate func(*DialogMedia)
 
 	closed bool
 }
@@ -223,8 +223,8 @@ func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) error {
 	// hold the reference
 	d.rtpSession = rtpSess
 
-	if d.onMediaUpdate != nil {
-		d.onMediaUpdate(d)
+	if d.OnMediaUpdate != nil {
+		d.OnMediaUpdate(d)
 	} else {
 		fmts := ""
 		for _, c := range msess.Codecs {

@@ -198,7 +198,7 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 	}
 
 	// This only gets called after session established
-	d.onMediaUpdate = opts.OnMediaUpdate
+	d.OnMediaUpdate = opts.OnMediaUpdate
 	// reuse UDP listener
 	// Problem if listener is unspecified IP sipgo will not map this to listener
 	// Code below only works if our bind host is specified
