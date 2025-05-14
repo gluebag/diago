@@ -589,7 +589,8 @@ func generateSDPForAudio(originIP net.IP, connectionIP net.IP, rtpPort int, mode
 	s := []string{
 		"v=0",
 		fmt.Sprintf("o=- %d %d IN IP4 %s", ntpTime, ntpTime, originIP),
-		"s=Sip Go Media",
+		//"s=Sip Go Media",
+		"s=-",
 		// "b=AS:84",
 		fmt.Sprintf("c=IN IP4 %s", connectionIP),
 		"t=0 0",
