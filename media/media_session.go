@@ -211,9 +211,9 @@ func (s *MediaSession) LocalSDP() []byte {
 	if connIP == nil {
 		connIP = ip
 	}
-	// if s.ExternalIP != nil {
-	// 	ip = s.ExternalIP
-	// }
+	if s.ExternalIP != nil {
+		ip = s.ExternalIP
+	}
 
 	return generateSDPForAudio(ip, connIP, rtpPort, s.Mode, s.Codecs)
 }
@@ -330,6 +330,11 @@ func (s *MediaSession) listenRTPandRTCP(laddr *net.UDPAddr) error {
 	if err != nil {
 		s.rtpConn.Close()
 		return err
+	}
+
+	if RTPDebug {
+		slog.Debug(fmt.Sprintf("[SETUP] Listening RTP %s", s.rtpConn.LocalAddr().String()))
+		slog.Debug(fmt.Sprintf("[SETUP] Listening RTCP %s", s.rtcpConn.LocalAddr().String()))
 	}
 
 	// Update laddr as it can be empheral
@@ -588,8 +593,11 @@ func generateSDPForAudio(originIP net.IP, connectionIP net.IP, rtpPort int, mode
 	// TODO optimize this with string builder
 	s := []string{
 		"v=0",
-		fmt.Sprintf("o=- %d %d IN IP4 %s", ntpTime, ntpTime, originIP),
-		//"s=Sip Go Media",
+		// GLUECHANGE
+		//fmt.Sprintf("o=- %d %d IN IP4 %s", ntpTime, ntpTime, originIP),
+		fmt.Sprintf("o=- %d %d IN IP4 %s", 0, ntpTime, originIP),
+		// GLUECHANGE
+		// "s=Sip Go Media",
 		"s=-",
 		// "b=AS:84",
 		fmt.Sprintf("c=IN IP4 %s", connectionIP),
@@ -602,6 +610,9 @@ func generateSDPForAudio(originIP net.IP, connectionIP net.IP, rtpPort int, mode
 		"a=ptime:20", // Needed for opus
 		"a=maxptime:20",
 		"a="+string(mode))
+	// GLUECHANGE (MAYBE ADD IN??? ALLOWS RTP/RTCP multiplexing)
+	//"a=rtcp-mux")
+
 	// s := []string{
 	// 	"v=0",
 	// 	fmt.Sprintf("o=- %d %d IN IP4 %s", ntpTime, ntpTime, originIP),

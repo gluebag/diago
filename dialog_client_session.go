@@ -259,6 +259,41 @@ func (d *DialogClientSession) waitAnswer(ctx context.Context, opts sipgo.AnswerO
 	return nil
 }
 
+func (d *DialogClientSession) HandleEarlyMediaSDP(res *sip.Response) (*media.RTPSession, error) {
+	sess := d.mediaSession
+
+	remoteSDP := res.Body()
+	if remoteSDP == nil {
+		return nil, fmt.Errorf("no SDP in response")
+	}
+	if err := sess.RemoteSDP(remoteSDP); err != nil {
+		return nil, err
+	}
+
+	// Check if rtp session already exists
+	d.mu.Lock()
+	if rtpSess := d.rtpSession; rtpSess != nil {
+		d.mu.Unlock()
+		return rtpSess, nil
+	}
+	d.mu.Unlock()
+
+	// Create RTP session. After this no media session configuration should be changed
+	rtpSess := media.NewRTPSession(sess)
+	d.mu.Lock()
+	d.initRTPSessionUnsafe(sess, rtpSess)
+	d.onCloseUnsafe(func() error {
+		return rtpSess.Close()
+	})
+	d.mu.Unlock()
+
+	// Must be called after reader and writer setup due to race
+	if err := rtpSess.MonitorBackground(); err != nil {
+		return nil, err
+	}
+	return rtpSess, nil
+}
+
 // Ack acknowledgeds media
 // Before Ack normally you want to setup more stuff like bridging
 func (d *DialogClientSession) Ack(ctx context.Context) error {
