@@ -211,9 +211,9 @@ func (s *MediaSession) LocalSDP() []byte {
 	if connIP == nil {
 		connIP = ip
 	}
-	if s.ExternalIP != nil {
-		ip = s.ExternalIP
-	}
+	//if s.ExternalIP != nil {
+	//	ip = s.ExternalIP
+	//}
 
 	return generateSDPForAudio(ip, connIP, rtpPort, s.Mode, s.Codecs)
 }
