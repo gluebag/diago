@@ -23,7 +23,7 @@ func NewWavWriter(w io.WriteSeeker) *WavWriter {
 	return &WavWriter{
 		SampleRate:  8000,
 		BitDepth:    16,
-		NumChans:    2,
+		NumChans:    1,
 		AudioFormat: 1, // 1 PCM
 		dataSize:    0,
 		W:           w,
