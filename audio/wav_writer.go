@@ -52,8 +52,13 @@ func (ww *WavWriter) writeData(audio []byte) (int, error) {
 	return n, err
 }
 
-func (ww *WavWriter) writeHeader() (int, error) {
-	w := ww.W
+func (ww *WavWriter) MakeHeader(customDataSize int64) []byte {
+
+	// If custom data size is not provided, use the current data size
+	if customDataSize == 0 {
+		customDataSize = ww.dataSize
+	}
+
 	// WAV header constants
 	const (
 		headerSize   = 44
@@ -65,7 +70,7 @@ func (ww *WavWriter) writeHeader() (int, error) {
 	bitsPerSample := ww.BitDepth
 	sampleRate := ww.SampleRate
 	// Calculate file size
-	fileSize := ww.dataSize + headerSize - 8
+	fileSize := customDataSize + headerSize - 8
 
 	// Create the header
 	header := make([]byte, headerSize)
@@ -85,7 +90,14 @@ func (ww *WavWriter) writeHeader() (int, error) {
 
 	// data chunk
 	copy(header[36:40], []byte("data"))
-	binary.LittleEndian.PutUint32(header[40:44], uint32(ww.dataSize))
+	binary.LittleEndian.PutUint32(header[40:44], uint32(customDataSize))
+	return header
+}
+
+func (ww *WavWriter) writeHeader() (int, error) {
+	w := ww.W
+
+	header := ww.MakeHeader(0)
 
 	// Combine header and audio payload
 	return w.Write(header)
