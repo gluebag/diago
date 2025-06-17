@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
@@ -42,6 +43,35 @@ func (d *DialogClientSession) Id() string {
 
 func (d *DialogClientSession) Hangup(ctx context.Context) error {
 	return d.Bye(ctx)
+}
+
+// SendCancelRequest sends custom CANCEL request made outside the current dialog
+func (d *DialogClientSession) SendCancelRequest(cancelRequest *sip.Request) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tx, err := d.TransactionRequest(ctx, cancelRequest)
+	if err != nil {
+		return err
+	}
+	// defer d.inviteTx.Terminate() // Terminates INVITE in all cases
+	defer tx.Terminate() // Terminates current transaction
+
+	// Wait 200
+	select {
+	case res := <-tx.Responses():
+		if res.StatusCode != 200 {
+			return sipgo.ErrDialogResponse{
+				Res: res,
+			}
+		}
+		//d.setState(sip.DialogStateEnded)
+		return nil
+	case <-tx.Done():
+		return tx.Err()
+	case <-ctx.Done():
+		return errors.New("timeout waiting for CANCEL response")
+	}
 }
 
 func (d *DialogClientSession) FromUser() string {
