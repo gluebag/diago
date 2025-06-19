@@ -285,6 +285,13 @@ func (s *MediaSession) createListeners(laddr *net.UDPAddr) error {
 	}
 
 	if laddr.Port == 0 && RTPPortStart > 0 && RTPPortEnd > RTPPortStart {
+
+		// Reset the offset if it exceeds the range
+		currentOffset := int(rtpPortOffset.Load())
+		if currentOffset >= (RTPPortEnd - RTPPortStart) {
+			rtpPortOffset.Store(0)
+		}
+
 		// Get next available port
 		port := RTPPortStart + int(rtpPortOffset.Load())
 		var err error
