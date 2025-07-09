@@ -47,6 +47,23 @@ func (d *DialogClientSession) Hangup(ctx context.Context) error {
 
 // SendCancelRequest sends custom CANCEL request made outside the current dialog
 func (d *DialogClientSession) SendCancelRequest(cancelRequest *sip.Request) error {
+	// Check if we have received any response first
+	if d.InviteResponse == nil {
+		return fmt.Errorf("cannot send CANCEL: no response received yet for INVITE")
+	}
+
+	if !d.InviteResponse.IsProvisional() {
+		return fmt.Errorf("cannot send CANCEL: response is not provisional (status: %d)", d.InviteResponse.StatusCode)
+	}
+
+	// Only send CANCEL if we're not in "Confirmed" or "Ended" state
+	dialogState := d.DialogSIP().LoadState()
+	if dialogState == sip.DialogStateConfirmed {
+		return fmt.Errorf("cannot send CANCEL: dialog confirmed already")
+	} else if dialogState == sip.DialogStateEnded {
+		return fmt.Errorf("cannot send CANCEL: dialog ended already")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
