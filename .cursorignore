@@ -1,0 +1,22 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+*.txt
+*.csv
+*.log
+*.log.*
+*.log.*.*
+*.log.*.*.*
+*.log.*.*.*.*
+*.log.*.*.*.*.*
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.ico
+*.webp
+*.ulaw
+*.wav
+*.mp3
+
+# exclude diago entirely while not working on it
+*
