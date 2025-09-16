@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/gluebag/diago/media"
 	"github.com/stretchr/testify/require"
 )
 

@@ -10,7 +10,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/emiago/diago/media"
+	"github.com/gluebag/diago/media"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zaf/g711"
