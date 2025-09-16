@@ -1,4 +1,4 @@
-module github.com/gluebag/diago
+module github.com/emiago/diago
 
 go 1.22.4
 
