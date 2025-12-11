@@ -7,7 +7,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/emiago/sipgo/fakes"
+	"github.com/gluebag/sipgo/fakes"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 )

@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/emiago/diago/media"
+	"github.com/gluebag/diago/media"
 )
 
 var rtpBufPool = sync.Pool{

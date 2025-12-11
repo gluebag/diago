@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/emiago/sipgo/sip"
+	"github.com/gluebag/sipgo/sip"
 	"github.com/icholy/digest"
 )
 

@@ -1,4 +1,4 @@
-module github.com/emiago/diago
+module github.com/gluebag/diago
 
 go 1.22.4
 
@@ -6,9 +6,9 @@ require (
 	github.com/emiago/sipgo v0.32.1
 	github.com/go-audio/riff v1.0.0
 	github.com/icholy/digest v1.1.0
-	github.com/pion/rtcp v1.2.14
-	github.com/pion/rtp v1.8.9
-	github.com/stretchr/testify v1.9.0
+	github.com/pion/rtcp v1.2.16
+	github.com/pion/rtp v1.8.26
+	github.com/stretchr/testify v1.11.1
 	github.com/zaf/g711 v1.4.0
 	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302
 )

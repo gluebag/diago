@@ -10,9 +10,9 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/emiago/diago"
-	"github.com/emiago/diago/examples"
-	"github.com/emiago/sipgo"
+	"github.com/gluebag/diago"
+	"github.com/gluebag/diago/examples"
+	"github.com/gluebag/sipgo"
 )
 
 // Dial this app with

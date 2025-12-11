@@ -12,11 +12,11 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/emiago/diago"
-	"github.com/emiago/diago/audio"
-	"github.com/emiago/diago/examples"
-	"github.com/emiago/diago/media"
-	"github.com/emiago/sipgo"
+	"github.com/gluebag/diago"
+	"github.com/gluebag/diago/audio"
+	"github.com/gluebag/diago/examples"
+	"github.com/gluebag/diago/media"
+	"github.com/gluebag/sipgo"
 )
 
 func main() {

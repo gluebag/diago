@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/emiago/diago/media"
+	"github.com/gluebag/diago/media"
 )
 
 type Bridger interface {

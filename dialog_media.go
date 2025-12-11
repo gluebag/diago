@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/emiago/diago/media"
-	"github.com/emiago/diago/media/sdp"
-	"github.com/emiago/sipgo/sip"
+	"github.com/gluebag/diago/media"
+	"github.com/gluebag/diago/media/sdp"
+	"github.com/gluebag/sipgo/sip"
 )
 
 var (

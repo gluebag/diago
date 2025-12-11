@@ -9,7 +9,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/emiago/sipgo/fakes"
+	"github.com/gluebag/sipgo/fakes"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )

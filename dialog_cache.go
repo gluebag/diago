@@ -8,8 +8,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/emiago/sipgo"
-	"github.com/emiago/sipgo/sip"
+	"github.com/gluebag/sipgo"
+	"github.com/gluebag/sipgo/sip"
 )
 
 type DialogCache[T DialogSession] interface {
