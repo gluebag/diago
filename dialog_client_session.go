@@ -90,51 +90,52 @@ func (d *DialogClientSession) SendCancelRequestV2Glue(ctx context.Context) error
 	return nil
 }
 
-// SendCancelRequest sends custom CANCEL request made outside the current dialog
-func (d *DialogClientSession) SendCancelRequest(cancelRequest *sip.Request) error {
-	// Check if we have received any response first
-	if d.InviteResponse == nil {
-		return fmt.Errorf("cannot send CANCEL: no response received yet for INVITE")
-	}
-
-	if !d.InviteResponse.IsProvisional() {
-		return fmt.Errorf("cannot send CANCEL: response is not provisional (status: %d)", d.InviteResponse.StatusCode)
-	}
-
-	// Only send CANCEL if we're not in "Confirmed" or "Ended" state
-	dialogState := d.DialogSIP().LoadState()
-	if dialogState == sip.DialogStateConfirmed {
-		return fmt.Errorf("cannot send CANCEL: dialog confirmed already")
-	} else if dialogState == sip.DialogStateEnded {
-		return fmt.Errorf("cannot send CANCEL: dialog ended already")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	tx, err := d.TransactionRequest(ctx, cancelRequest)
-	if err != nil {
-		return err
-	}
-	// defer d.inviteTx.Terminate() // Terminates INVITE in all cases
-	defer tx.Terminate() // Terminates current transaction
-
-	// Wait 200
-	select {
-	case res := <-tx.Responses():
-		if res.StatusCode != 200 {
-			return sipgo.ErrDialogResponse{
-				Res: res,
-			}
-		}
-		//d.setState(sip.DialogStateEnded)
-		return nil
-	case <-tx.Done():
-		return tx.Err()
-	case <-ctx.Done():
-		return errors.New("timeout waiting for CANCEL response")
-	}
-}
+//
+//// SendCancelRequest sends custom CANCEL request made outside the current dialog
+//func (d *DialogClientSession) SendCancelRequest(cancelRequest *sip.Request) error {
+//	// Check if we have received any response first
+//	if d.InviteResponse == nil {
+//		return fmt.Errorf("cannot send CANCEL: no response received yet for INVITE")
+//	}
+//
+//	if !d.InviteResponse.IsProvisional() {
+//		return fmt.Errorf("cannot send CANCEL: response is not provisional (status: %d)", d.InviteResponse.StatusCode)
+//	}
+//
+//	// Only send CANCEL if we're not in "Confirmed" or "Ended" state
+//	dialogState := d.DialogSIP().LoadState()
+//	if dialogState == sip.DialogStateConfirmed {
+//		return fmt.Errorf("cannot send CANCEL: dialog confirmed already")
+//	} else if dialogState == sip.DialogStateEnded {
+//		return fmt.Errorf("cannot send CANCEL: dialog ended already")
+//	}
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//	defer cancel()
+//
+//	tx, err := d.TransactionRequest(ctx, cancelRequest)
+//	if err != nil {
+//		return err
+//	}
+//	// defer d.inviteTx.Terminate() // Terminates INVITE in all cases
+//	defer tx.Terminate() // Terminates current transaction
+//
+//	// Wait 200
+//	select {
+//	case res := <-tx.Responses():
+//		if res.StatusCode != 200 {
+//			return sipgo.ErrDialogResponse{
+//				Res: res,
+//			}
+//		}
+//		//d.setState(sip.DialogStateEnded)
+//		return nil
+//	case <-tx.Done():
+//		return tx.Err()
+//	case <-ctx.Done():
+//		return errors.New("timeout waiting for CANCEL response")
+//	}
+//}
 
 func (d *DialogClientSession) FromUser() string {
 	return d.InviteRequest.From().Address.User
