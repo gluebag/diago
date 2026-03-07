@@ -1,13 +1,24 @@
+// SPDX-License-Identifier: MPL-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2024, Emir Aganovic
+
 package diago
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/gluebag/diago/audio"
 	"github.com/gluebag/diago/examples"
+	"github.com/gluebag/diago/media"
 	"github.com/gluebag/diago/media/sdp"
+	"github.com/gluebag/diago/testdata"
 	"github.com/gluebag/sipgo"
 	"github.com/gluebag/sipgo/sip"
 	"github.com/stretchr/testify/assert"
@@ -82,7 +93,7 @@ func TestDiagoInviteCallerID(t *testing.T) {
 
 		assert.Equal(t, dg.ua.Name(), req.From().Address.User)
 		assert.Equal(t, dg.ua.Hostname(), req.From().Address.Host)
-		assert.NotEmpty(t, req.From().Params["tag"])
+		assert.NotEmpty(t, req.From().Params.GetOr("tag", ""))
 	})
 
 }
@@ -227,4 +238,249 @@ func TestIntegrationDiagoTransportEmpheralPort(t *testing.T) {
 	newTran, _ := dg.getTransport("udp")
 	t.Log("port assigned", newTran.BindPort)
 	assert.NotEmpty(t, newTran.BindPort)
+}
+
+func TestIntegrationDiagoCallWithCustomCodecs(t *testing.T) {
+	// TODO: USE TLS as transport for more correct test
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	l16Codec := media.Codec{
+		Name:        "L16",
+		PayloadType: 98,
+		SampleRate:  8000,
+		SampleDur:   20 * time.Millisecond,
+		NumChannels: 1,
+	}
+
+	{
+		ua, _ := sipgo.NewUA()
+		defer ua.Close()
+
+		dg := NewDiago(ua,
+			WithTransport(
+				Transport{
+					ID:        "tcp",
+					Transport: "tcp",
+					BindHost:  "127.0.0.1",
+					BindPort:  15066,
+				},
+			),
+			WithMediaConfig(
+				MediaConfig{
+					Codecs: []media.Codec{l16Codec, media.CodecAudioAlaw},
+				},
+			))
+
+		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+			d.Trying()
+			if err := d.Answer(); err != nil {
+				panic(err)
+			}
+
+			err := d.Echo()
+			slog.Info("Echo finished with", "error", err)
+
+		})
+		require.NoError(t, err)
+	}
+
+	ua, _ := sipgo.NewUA()
+	defer ua.Close()
+	dg := NewDiago(ua,
+		WithTransport(
+			Transport{
+				ID:        "tcp",
+				Transport: "tcp",
+				BindHost:  "127.0.0.1",
+			},
+		),
+		WithMediaConfig(
+			MediaConfig{
+				Codecs: []media.Codec{l16Codec, media.CodecAudioAlaw},
+			},
+		))
+
+	d, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 15066}, InviteOptions{Transport: "tcp"})
+	require.NoError(t, err)
+
+	l16Audio := bytes.Repeat([]byte{0, 16, 96, 0}, l16Codec.Samples16()/4)
+	reader := bytes.NewBuffer(l16Audio)
+	r, _ := d.AudioReader()
+	w, _ := d.AudioWriter()
+	_, err = media.Copy(reader, w)
+	require.ErrorIs(t, err, io.EOF)
+
+	recv := make([]byte, len(l16Audio))
+	r.Read(recv)
+	assert.Equal(t, l16Audio, recv)
+}
+
+func TestIntegrationDiagoSRTPCall(t *testing.T) {
+	// TODO: USE TLS as transport for more correct test
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	{
+		ua, _ := sipgo.NewUA()
+		defer ua.Close()
+
+		dg := NewDiago(ua,
+			WithTransport(
+				Transport{
+					ID:        "tcp",
+					Transport: "tcp",
+					BindHost:  "127.0.0.1",
+					BindPort:  15443,
+					MediaSRTP: 1, // This enables SRTP
+				},
+			),
+			WithMediaConfig(
+				MediaConfig{
+					Codecs: []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw},
+				},
+			))
+
+		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+			d.Trying()
+			if err := d.Answer(); err != nil {
+				panic(err)
+			}
+
+			err := d.Echo()
+			slog.Info("Echo finished with", "error", err)
+
+		})
+		require.NoError(t, err)
+	}
+
+	ua, _ := sipgo.NewUA()
+	defer ua.Close()
+	dg := NewDiago(ua,
+		WithTransport(
+			Transport{
+				ID:        "tcp",
+				Transport: "tcp",
+				BindHost:  "127.0.0.1",
+				BindPort:  15441,
+				MediaSRTP: 1, // USE SRTP
+			},
+		),
+		WithMediaConfig(
+			MediaConfig{
+				Codecs: []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw},
+			},
+		))
+
+	// err = dg.ServeBackground(ctx, func(d *DialogServerSession) {})
+	// require.NoError(t, err)
+
+	d, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 15443}, InviteOptions{Transport: "tcp"})
+	require.NoError(t, err)
+
+	// pb, err := d.PlaybackCreate()
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	ulaw := make([]byte, 160)
+	audio.EncodeUlawTo(ulaw, bytes.Repeat([]byte{1}, 320))
+
+	reader := bytes.NewBuffer(ulaw)
+	r, _ := d.AudioReader()
+	w, _ := d.AudioWriter()
+	_, err = media.Copy(reader, w)
+	require.ErrorIs(t, err, io.EOF)
+
+	recv := make([]byte, 160)
+	r.Read(recv)
+	assert.Equal(t, ulaw, recv)
+}
+
+func TestIntegrationDiagoDTLSCall(t *testing.T) {
+	// TODO: USE TLS as transport for more correct test
+	// media.DTLSDebug = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	{
+		ua, _ := sipgo.NewUA()
+		defer ua.Close()
+
+		dg := NewDiago(ua,
+			WithTransport(
+				Transport{
+					ID:        "tcp",
+					Transport: "tcp",
+					BindHost:  "127.0.0.1",
+					BindPort:  16443,
+					MediaSRTP: 2, // This enables SRTP DTLS
+					MediaDTLSConf: media.DTLSConfig{
+						Certificates:     []tls.Certificate{testdata.ServerCertificate()},
+						ServerClientAuth: media.ServerClientAuthNoCert,
+					},
+				},
+			),
+			WithMediaConfig(
+				MediaConfig{
+					Codecs: []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw},
+				},
+			))
+
+		err := dg.ServeBackground(ctx, func(d *DialogServerSession) {
+			d.Trying()
+			if err := d.Answer(); err != nil {
+				panic(err)
+			}
+
+			err := d.Echo()
+			slog.Info("Echo finished with", "error", err)
+
+		})
+		require.NoError(t, err)
+	}
+
+	ua, _ := sipgo.NewUA()
+	defer ua.Close()
+	dg := NewDiago(ua,
+		WithTransport(
+			Transport{
+				ID:        "tcp",
+				Transport: "tcp",
+				BindHost:  "127.0.0.1",
+				BindPort:  16441,
+				MediaSRTP: 2, // USE DTLS
+				// We do not need any Certificate verification
+				MediaDTLSConf: media.DTLSConfig{},
+			},
+		),
+		WithMediaConfig(
+			MediaConfig{
+				Codecs: []media.Codec{media.CodecAudioUlaw, media.CodecAudioAlaw},
+			},
+		))
+
+	// err = dg.ServeBackground(ctx, func(d *DialogServerSession) {})
+	// require.NoError(t, err)
+
+	d, err := dg.Invite(ctx, sip.Uri{User: "11", Host: "127.0.0.1", Port: 16443}, InviteOptions{Transport: "tcp"})
+	require.NoError(t, err)
+
+	// pb, err := d.PlaybackCreate()
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	ulaw := make([]byte, 160)
+	audio.EncodeUlawTo(ulaw, bytes.Repeat([]byte{1}, 320))
+
+	reader := bytes.NewBuffer(ulaw)
+	r, _ := d.AudioReader()
+	w, _ := d.AudioWriter()
+	time.Sleep(1 * time.Second)
+	t.Log("---------------------------Writing media")
+	_, err = media.Copy(reader, w)
+	require.ErrorIs(t, err, io.EOF)
+
+	recv := make([]byte, 160)
+	r.Read(recv)
+	assert.Equal(t, ulaw, recv)
 }

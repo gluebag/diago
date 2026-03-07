@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -65,7 +66,7 @@ func NewRTPPacketReaderSession(sess *RTPSession) *RTPPacketReader {
 
 // used for tests only
 func newRTPPacketReaderMedia(sess *MediaSession) *RTPPacketReader {
-	codec := CodecFromSession(sess)
+	codec := CodecAudioFromSession(sess)
 	w := NewRTPPacketReader(sess, codec)
 	return w
 }
@@ -77,7 +78,7 @@ func NewRTPPacketReader(reader RTPReader, codec Codec) *RTPPacketReader {
 		seqReader: RTPExtendedSequenceNumber{},
 		// unreadPayload: make([]byte, RTPBufSize),
 		// rtpBuffer:     make([]byte, RTPBufSize),
-		log: slog.Default().With("caller", "media"),
+		log: DefaultLogger().With("caller", "media"),
 	}
 
 	return &w
@@ -119,6 +120,22 @@ func (r *RTPPacketReader) Read(b []byte) (int, error) {
 
 	rtpN, err := reader.ReadRTP(buf, pkt)
 	if err != nil {
+		// In case we error while new reader update happen, then retry again
+		// This can be deadline, timeout, or connection closed
+		r.mu.RLock()
+		newReader := r.reader
+		r.mu.RUnlock()
+		if newReader != reader {
+			// Make sure read is enabled if this is rtp connection
+			// Reason is we SetDeadline on Update but media session may not change connection
+			// TODO we may need to expose this
+			if ms, ok := newReader.(*MediaSession); ok {
+				ms.rtpConn.SetReadDeadline(time.Time{})
+			}
+			rtpN, err = newReader.ReadRTP(buf, pkt)
+		}
+	}
+	if err != nil {
 		// For now underhood IO should only net closed
 		// Here we are returning EOF to be io package compatilble
 		// like with func io.ReadAll
@@ -129,7 +146,7 @@ func (r *RTPPacketReader) Read(b []byte) (int, error) {
 	}
 	if rtpN == 0 {
 		// ZERO Payload?
-		r.log.Warn("ZERO Payload on RTP")
+		r.log.Debug("ZERO Payload on RTP", "header", pkt.Header)
 		return 0, nil
 	}
 
@@ -138,6 +155,10 @@ func (r *RTPPacketReader) Read(b []byte) (int, error) {
 	// if pt != pkt.PayloadType {
 	// 	return 0, fmt.Errorf("payload type does not match. expected=%d, actual=%d", pt, pkt.PayloadType)
 	// }
+	if payloadSize <= 0 {
+		r.log.Debug("Invalid payload size", "rtpN", rtpN, "headerSize", pkt.Header.MarshalSize(), "padding", pkt.PaddingSize)
+		return 0, nil
+	}
 
 	// If we are tracking this source, do check are we keep getting pkts in sequence
 	if r.lastSSRC == pkt.SSRC {
@@ -189,6 +210,7 @@ func (r *RTPPacketReader) Reader() RTPReader {
 
 func (r *RTPPacketReader) UpdateRTPSession(rtpSess *RTPSession) {
 	r.UpdateReader(rtpSess)
+
 	// codec := CodecFromSession(rtpSess.Sess)
 	// r.mu.Lock()
 	// r.RTPSession = rtpSess
@@ -200,6 +222,11 @@ func (r *RTPPacketReader) UpdateRTPSession(rtpSess *RTPSession) {
 func (r *RTPPacketReader) UpdateReader(reader RTPReader) {
 	// codec := CodecFromSession(rtpSess.Sess)
 	r.mu.Lock()
+	// Make sure that current reading is stopped
+	if m, ok := r.reader.(*MediaSession); ok {
+		m.rtpConn.SetReadDeadline(time.Now())
+	}
 	r.reader = reader
+	// TODO we need to make sure that current Audio Reading is really stopped before updating
 	r.mu.Unlock()
 }

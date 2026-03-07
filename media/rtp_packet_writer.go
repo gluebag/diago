@@ -48,6 +48,7 @@ type RTPPacketWriter struct {
 	// Internals
 	// clock rate is decided based on media
 	sampleRateTimestamp uint32
+	lastSampleTime      time.Time
 	seqWriter           RTPExtendedSequenceNumber
 	nextTimestamp       uint32
 	initTimestamp       uint32
@@ -81,7 +82,7 @@ func NewRTPPacketWriter(writer RTPWriter, codec Codec) *RTPPacketWriter {
 
 // NewRTPPacketWriterSession creates RTPPacketWriter and attaches RTP Session expected values
 func NewRTPPacketWriterSession(sess *RTPSession) *RTPPacketWriter {
-	codec := CodecFromSession(sess.Sess)
+	codec := CodecAudioFromSession(sess.Sess)
 	w := NewRTPPacketWriter(sess, codec)
 	// We need to add our SSRC due to sender report, which can be empty until data comes
 	// It is expected that nothing travels yet through rtp session
@@ -100,22 +101,59 @@ func (w *RTPPacketWriter) updateClockRate(cod Codec) {
 	}
 }
 
+// ResetTimestamp can mark new stream comming. If stream is continuous it will add timestamp difference
+// MUST Not be called during stream Write
+func (p *RTPPacketWriter) ResetTimestamp() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.lastSampleTime.IsZero() {
+		// Detect delays in audio and update RTP timestamp
+		t := time.Now()
+		diff := t.Sub(p.lastSampleTime)
+		diffTimestamp := uint32(diff.Seconds() * float64(p.sampleRate))
+
+		p.nextTimestamp += diffTimestamp
+		p.initTimestamp = p.nextTimestamp // This will now make Marker true
+		return
+	}
+}
+
+// InitTimestamp returns init RTP timestamp
+func (p *RTPPacketWriter) InitTimestamp() uint32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.initTimestamp
+}
+
+func (p *RTPPacketWriter) DelayTimestamp(ofsset uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextTimestamp += ofsset
+}
+
 // Write implements io.Writer and does payload RTP packetization
 // Media clock rate is determined
 // For more control or dynamic payload WriteSamples can be used
 // It is not thread safe and order of payload frames is required
 func (p *RTPPacketWriter) Write(b []byte) (int, error) {
 	p.mu.RLock()
-	n, err := p.WriteSamples(b, p.sampleRateTimestamp, p.nextTimestamp == p.initTimestamp, p.payloadType)
+	n, err := p.writeSamplesUnsafe(p.writer, b, p.sampleRateTimestamp, p.nextTimestamp == p.initTimestamp, p.payloadType)
 	p.mu.RUnlock()
-	<-p.clockTicker.C
+	p.lastSampleTime = <-p.clockTicker.C
 	return n, err
 }
 
 // WriteSamples allows to skip default packet rate.
 // This is useful if you need to write different payload but keeping same SSRC
 func (p *RTPPacketWriter) WriteSamples(payload []byte, sampleRateTimestamp uint32, marker bool, payloadType uint8) (int, error) {
-	writer := p.writer
+	p.mu.RLock()
+	n, err := p.writeSamplesUnsafe(p.writer, payload, sampleRateTimestamp, marker, payloadType)
+	p.mu.RUnlock()
+	return n, err
+}
+
+func (p *RTPPacketWriter) writeSamplesUnsafe(writer RTPWriter, payload []byte, sampleRateTimestamp uint32, marker bool, payloadType uint8) (int, error) {
 	pkt := &p.packet
 	pkt.Header = rtp.Header{
 		Version:     2,
@@ -156,7 +194,7 @@ func (w *RTPPacketWriter) UpdateRTPSession(rtpSess *RTPSession) {
 	defer w.mu.Unlock()
 
 	// In case of codec cha
-	codec := CodecFromSession(rtpSess.Sess)
+	codec := CodecAudioFromSession(rtpSess.Sess)
 	w.payloadType = codec.PayloadType
 	w.sampleRate = codec.SampleRate
 	w.updateClockRate(codec)

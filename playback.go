@@ -4,6 +4,7 @@
 package diago
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ var playBufPool = sync.Pool{
 type AudioPlayback struct {
 	writer io.Writer
 	codec  media.Codec
+	onPlay func()
 
 	// Read only values
 	// This will influence playout sampling buffer
@@ -49,16 +51,28 @@ func NewAudioPlayback(writer io.Writer, codec media.Codec) AudioPlayback {
 	}
 }
 
+func (p *AudioPlayback) Codec() media.Codec {
+	return p.codec
+}
+
 // Play is generic approach to play supported audio contents
 // Empty mimeType will stream reader as buffer. Make sure that bitdepth and numchannels is set correctly
 func (p *AudioPlayback) Play(reader io.Reader, mimeType string) (int64, error) {
 	var written int64
 	var err error
+
+	if p.onPlay != nil {
+		// Execute hook on play
+		p.onPlay()
+	}
+
 	switch mimeType {
 	case "":
 		written, err = p.stream(reader, p.writer)
 	case "audio/wav", "audio/x-wav", "audio/wav-x", "audio/vnd.wave":
 		written, err = p.streamWav(reader, p.writer)
+	case "audio/pcm":
+		written, err = p.streamPCM(reader, p.writer)
 	default:
 		return 0, fmt.Errorf("unsuported content type %q", mimeType)
 	}
@@ -83,7 +97,9 @@ func (p *AudioPlayback) PlayFile(filename string) (int64, error) {
 		return 0, fmt.Errorf("only playing wav file is now supported, but detected=%s", ext)
 	}
 
-	return p.Play(file, "audio/wav")
+	// Using bufio to improve disk reading
+	fileReader := bufio.NewReaderSize(file, 64*1024)
+	return p.Play(fileReader, "audio/wav")
 }
 
 func (p *AudioPlayback) stream(body io.Reader, playWriter io.Writer) (int64, error) {
@@ -92,41 +108,57 @@ func (p *AudioPlayback) stream(body io.Reader, playWriter io.Writer) (int64, err
 	defer playBufPool.Put(buf)
 	payloadBuf := buf.([]byte)[:payloadSize] // 20 ms
 
-	written, err := copyWithBuf(body, playWriter, payloadBuf)
+	written, err := media.CopyWithBuf(body, playWriter, payloadBuf)
+	return written, err
+}
+
+func (p *AudioPlayback) streamPCM(body io.Reader, playWriter io.Writer) (int64, error) {
+	codec := p.codec
+	payloadSize := p.calcPlayoutSize()
+	buf := playBufPool.Get()
+	defer playBufPool.Put(buf)
+	payloadBuf := buf.([]byte)[:payloadSize] // 20 ms
+
+	enc := &audio.PCMEncoderWriter{}
+	if err := enc.Init(codec, playWriter); err != nil {
+		return 0, fmt.Errorf("failed to create PCM encoder: %w", err)
+	}
+
+	written, err := media.CopyWithBuf(body, enc, payloadBuf)
 	return written, err
 }
 
 func (p *AudioPlayback) streamWav(body io.Reader, playWriter io.Writer) (int64, error) {
-	codec := &p.codec
-	dec := audio.NewWavReader(body)
-	if err := dec.ReadHeaders(); err != nil {
+	codec := p.codec
+	wavReader := audio.NewWavReader(body)
+	if err := wavReader.ReadHeaders(); err != nil {
 		return 0, err
 	}
-	if dec.BitsPerSample != uint16(p.BitDepth) {
-		return 0, fmt.Errorf("wav file bitdepth=%d does not match expected=%d", dec.BitsPerSample, p.BitDepth)
+	if wavReader.BitsPerSample != uint16(p.BitDepth) {
+		return 0, fmt.Errorf("wav file bitdepth=%d does not match expected=%d", wavReader.BitsPerSample, p.BitDepth)
 	}
-	if dec.SampleRate != codec.SampleRate {
-		return 0, fmt.Errorf("wav file samplerate=%d does not match expected=%d", dec.SampleRate, codec.SampleRate)
+	if wavReader.SampleRate != codec.SampleRate {
+		return 0, fmt.Errorf("wav file samplerate=%d does not match expected=%d", wavReader.SampleRate, codec.SampleRate)
 	}
-	if dec.NumChannels != uint16(codec.NumChannels) {
-		return 0, fmt.Errorf("wav file numchannels=%d does not match expected=%d", dec.NumChannels, codec.NumChannels)
+	if wavReader.NumChannels != uint16(codec.NumChannels) {
+		return 0, fmt.Errorf("wav file numchannels=%d does not match expected=%d", wavReader.NumChannels, codec.NumChannels)
 	}
 
 	// We need to read and packetize to 20 ms
 	// sampleDurMS := int(codec.SampleDur.Milliseconds())
 	// payloadSize := int(dec.BitsPerSample) / 8 * int(dec.NumChannels) * int(dec.SampleRate) / 1000 * sampleDurMS
-	payloadSize := p.codec.SamplesPCM(int(dec.BitsPerSample))
+	payloadSize := p.codec.SamplesPCM(int(wavReader.BitsPerSample))
 
 	buf := playBufPool.Get()
 	defer playBufPool.Put(buf)
 	payloadBuf := buf.([]byte)[:payloadSize] // 20 ms
 
-	enc, err := audio.NewPCMEncoderWriter(codec.PayloadType, playWriter)
-	if err != nil {
+	enc := &audio.PCMEncoderWriter{}
+	if err := enc.Init(codec, playWriter); err != nil {
 		return 0, fmt.Errorf("failed to create PCM encoder: %w", err)
 	}
 
-	written, err := media.CopyWithBuf(dec, enc, payloadBuf)
+	written, err := media.CopyWithBuf(wavReader, enc, payloadBuf)
 	// written, err := wavCopy(dec, enc, payloadBuf)
 	return written, err
 }

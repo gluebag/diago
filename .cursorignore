@@ -17,6 +17,3 @@
 *.ulaw
 *.wav
 *.mp3
-
-# exclude diago entirely while not working on it
-*

@@ -11,12 +11,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"slices"
 	"sync"
 	"time"
 
+	"github.com/gluebag/diago/audio"
 	"github.com/gluebag/diago/media"
 	"github.com/gluebag/diago/media/sdp"
 	"github.com/gluebag/sipgo/sip"
@@ -24,23 +24,25 @@ import (
 
 var (
 	HTTPDebug = os.Getenv("HTTP_DEBUG") == "true"
-	// TODO remove client singleton
-	client = http.Client{
-		Timeout: 10 * time.Second,
+
+	DefaultPlaybackHTTPClient = http.Client{
+		Timeout: 20 * time.Second,
 	}
+
+	errNoRTPSession = errors.New("no rtp session")
 )
 
 func init() {
 	if HTTPDebug {
-		client.Transport = &loggingTransport{}
+		DefaultPlaybackHTTPClient.Transport = &loggingTransport{}
 	}
 }
 
 // DialogMedia is common struct for server and client session and it shares same functionality
 // which is mostly arround media
 type DialogMedia struct {
-	mu sync.Mutex
-
+	mu  sync.Mutex
+	log *slog.Logger
 	// media session is RTP local and remote
 	// it is forked on media changes and updated on writer and reader
 	// must be mutex protected
@@ -67,9 +69,11 @@ type DialogMedia struct {
 	audioReader io.Reader
 	audioWriter io.Writer
 
-	// lastInvite is actual last invite sent by remote REINVITE
+	// remoteContactTarget is actual target changed caused by incomign or outgoing REINVITE
 	// We do not use sipgo as this needs mutex but also keeping original invite
-	lastInvite *sip.Request
+	remoteContactTarget *sip.ContactHeader
+
+	onReferNotify func(statusCode int)
 
 	onClose       func() error
 	OnMediaUpdate func(*DialogMedia)
@@ -90,18 +94,23 @@ func (d *DialogMedia) Close() error {
 	onClose := d.onClose
 	d.onClose = nil
 	m := d.mediaSession
+	rtpSess := d.rtpSession
 
 	d.mu.Unlock()
 
-	var e1, e2 error
+	var e1, e2, e3 error
 	if onClose != nil {
 		e1 = onClose()
 	}
 
-	if m != nil {
-		e2 = m.Close()
+	if rtpSess != nil {
+		e2 = rtpSess.Close()
 	}
-	return errors.Join(e1, e2)
+
+	if m != nil {
+		e3 = m.Close()
+	}
+	return errors.Join(e1, e2, e3)
 }
 
 func (d *DialogMedia) OnClose(f func() error) {
@@ -162,6 +171,10 @@ func (d *DialogMedia) initMediaSessionFromConf(conf MediaConfig) error {
 		Laddr:      net.UDPAddr{IP: bindIP, Port: 0},
 		ExternalIP: conf.externalIP,
 		Mode:       sdp.ModeSendrecv,
+		SecureRTP:  conf.secureRTP,
+		SRTPAlg:    conf.SecureRTPAlg,
+		RTPNAT:     conf.rtpNAT,
+		DTLSConf:   conf.dtlsConf,
 	}
 
 	if err := sess.Init(); err != nil {
@@ -188,10 +201,14 @@ func (d *DialogMedia) MediaSession() *media.MediaSession {
 func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransaction, contactHDR sip.Header) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.lastInvite = req
+	d.remoteContactTarget = req.Contact().Clone()
 
-	if err := d.sdpReInviteUnsafe(req.Body()); err != nil {
-		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
+	// When body is not present this can mean client is doing keep alive
+	// Still offer needs to be responded
+	if req.Body() != nil {
+		if err := d.sdpReInviteUnsafe(req.Body()); err != nil {
+			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestTerminated, "Request Terminated - "+err.Error(), nil))
+		}
 	}
 
 	// Reply with updated SDP
@@ -204,23 +221,96 @@ func (d *DialogMedia) handleMediaUpdate(req *sip.Request, tx sip.ServerTransacti
 
 // Must be protected with lock
 func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) error {
-	msess := d.mediaSession.Fork()
-	if err := msess.RemoteSDP(sdp); err != nil {
-		return fmt.Errorf("reinvite media remote SDP applying failed: %w", err)
+	if d.mediaSession == nil {
+		return fmt.Errorf("no media session present")
 	}
 
-	d.mediaSession = msess
+	if err := d.sdpUpdateUnsafe(sdp); err != nil {
+		return err
+	}
+
+	if d.OnMediaUpdate != nil {
+		d.OnMediaUpdate(d)
+	}
+
+	return nil
+}
+
+func (d *DialogMedia) checkEarlyMedia(remoteSDP []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// RTP Session is only created when negotiation is finished. We use this to detect existing media
+	if d.rtpSession == nil {
+		return errNoRTPSession
+	}
+	return d.sdpUpdateUnsafe(remoteSDP)
+}
+
+func (d *DialogMedia) sdpUpdateUnsafe(sdp []byte) error {
+	msess := d.mediaSession.Fork()
+	if err := msess.RemoteSDP(sdp); err != nil {
+		return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
+	}
+
+	// TODO remove this with call mediaUpdateUnsafe
+	// Stop existing rtp
+	if d.rtpSession != nil {
+		if err := d.rtpSession.Close(); err != nil {
+			return err
+		}
+	}
 
 	rtpSess := media.NewRTPSession(msess)
-	d.onCloseUnsafe(func() error {
-		return rtpSess.Close()
-	})
+	// d.onCloseUnsafe(func() error {
+	// 	return rtpSess.Close()
+	// })
+
+	if err := rtpSess.MonitorBackground(); err != nil {
+		rtpSess.Close()
+		return err
+	}
 
 	d.RTPPacketReader.UpdateRTPSession(rtpSess)
 	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
-	rtpSess.MonitorBackground()
 
-	// hold the reference
+	// update the reference
+	d.mediaSession = msess
+	d.rtpSession = rtpSess
+	return nil
+}
+
+func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
+	// Stop existing rtp
+	if d.rtpSession != nil {
+		if err := d.rtpSession.Close(); err != nil {
+			return err
+		}
+	}
+
+	rtpSess := media.NewRTPSession(msess)
+	if err := rtpSess.MonitorBackground(); err != nil {
+		rtpSess.Close()
+		return err
+	}
+
+	// d.onCloseUnsafe(func() error {
+	// 	return rtpSess.Close()
+	// })
+
+	// Make sure any current reader is not consuming old media session
+	d.RTPPacketReader.UpdateRTPSession(rtpSess)
+	d.RTPPacketWriter.UpdateRTPSession(rtpSess)
+
+	// If connection IP changed close
+	// TODO can we make this better?
+	if !d.mediaSession.Laddr.IP.Equal(msess.Laddr.IP) || d.mediaSession.Laddr.Port != msess.Laddr.Port {
+		if err := d.mediaSession.Close(); err != nil {
+			return err
+		}
+	}
+
+	// update the reference
+	d.mediaSession = msess
 	d.rtpSession = rtpSess
 
 	if d.OnMediaUpdate != nil {
@@ -230,11 +320,11 @@ func (d *DialogMedia) sdpReInviteUnsafe(sdp []byte) error {
 		for _, c := range msess.Codecs {
 			fmts += c.Name
 		}
-		slog.Info("Media/RTP session updated",
-			slog.String("formats", fmts),
-			slog.String("localAddr", msess.Laddr.String()),
-			slog.String("remoteAddr", msess.Raddr.String()),
-		)
+		//d.log.Debug("Media/RTP session updated",
+		//	"formats", fmts,
+		//	"localAddr", msess.Laddr.String(),
+		//	"remoteAddr", msess.Raddr.String(),
+		//)
 	}
 
 	return nil
@@ -250,7 +340,7 @@ type MediaProps struct {
 
 func WithAudioReaderMediaProps(p *MediaProps) AudioReaderOption {
 	return func(d *DialogMedia) error {
-		p.Codec = media.CodecFromSession(d.mediaSession)
+		p.Codec = media.CodecAudioFromSession(d.mediaSession)
 		p.Laddr = d.mediaSession.Laddr.String()
 		p.Raddr = d.mediaSession.Raddr.String()
 		return nil
@@ -281,11 +371,12 @@ func WithAudioReaderDTMF(r *DTMFReader) AudioReaderOption {
 	}
 }
 
-// AudioReader gets current audio reader. It MUST be called after Answer.
-// Use AuidioListen for optimized reading.
+// AudioReader returns io.Reader on which you can read your ENCODED audio.
+// By default it is RTPPacketReader unless overwritten with SetAudioReader().
+//
+// NOTE: AudioReader must be called after negotiation is finished, like Answer()
 // Reading buffer should be equal or bigger of media.RTPBufSize
-// Options allow more intercepting audio reading like Stats or DTMF
-// NOTE that this interceptors will stay,
+// Use AuidioListen for optimized reading.
 func (d *DialogMedia) AudioReader(opts ...AudioReaderOption) (io.Reader, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -326,7 +417,7 @@ type AudioWriterOption func(d *DialogMedia) error
 
 func WithAudioWriterMediaProps(p *MediaProps) AudioWriterOption {
 	return func(d *DialogMedia) error {
-		p.Codec = media.CodecFromSession(d.mediaSession)
+		p.Codec = media.CodecAudioFromSession(d.mediaSession)
 		p.Laddr = d.mediaSession.Laddr.String()
 		p.Raddr = d.mediaSession.Raddr.String()
 		return nil
@@ -356,6 +447,9 @@ func WithAudioWriterDTMF(r *DTMFWriter) AudioWriterOption {
 	}
 }
 
+// AudioWriter returns io.Writer on which you can write your ENCODED audio.
+// By default it is RTPPacketWriter unless overwritten with SetAudioWriter().
+// NOTE: RTPPacketWriter has running sample clock, but it expects samples sent, match sample duration of codec.
 func (d *DialogMedia) AudioWriter(opts ...AudioWriterOption) (io.Writer, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -385,7 +479,7 @@ func (d *DialogMedia) audioWriterProps(p *MediaProps) io.Writer {
 }
 
 // SetAudioWriter adds/changes audio reader.
-// Use this when you want to have interceptors of your audio
+// Use this when you want to have pipelines of your audio
 func (d *DialogMedia) SetAudioWriter(r io.Writer) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -419,6 +513,8 @@ func (d *DialogMedia) PlaybackCreate() (AudioPlayback, error) {
 		return AudioPlayback{}, fmt.Errorf("no media setup")
 	}
 	p := NewAudioPlayback(w, mprops.Codec)
+	// On each play it needs reset RTP timestamp
+	p.onPlay = d.RTPPacketWriter.ResetTimestamp
 	return p, nil
 }
 
@@ -443,53 +539,84 @@ func (d *DialogMedia) PlaybackControlCreate() (AudioPlaybackControl, error) {
 	return p, nil
 }
 
-type loggingTransport struct{}
-
-func (s *loggingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	bytes, _ := httputil.DumpRequestOut(r, false)
-
-	resp, err := http.DefaultTransport.RoundTrip(r)
-	// err is returned after dumping the response
-
-	respBytes, _ := httputil.DumpResponse(resp, false)
-	bytes = append(bytes, respBytes...)
-
-	slog.Debug(fmt.Sprintf("HTTP Debug:\n%s\n", bytes))
-
-	return resp, err
-}
-
-func (d *DialogMedia) Listen() error {
-	buf := make([]byte, media.RTPBufSize)
-	audioRader := d.getAudioReader()
-	for {
-		_, err := audioRader.Read(buf)
-		if err != nil {
-			return err
-		}
+// PlaybackRingtoneCreate is creating playback for ringtone
+//
+// Experimental
+func (d *DialogMedia) PlaybackRingtoneCreate() (AudioRingtone, error) {
+	mprops := MediaProps{}
+	w := d.audioWriterProps(&mprops)
+	if w == nil {
+		return AudioRingtone{}, fmt.Errorf("no media setup")
 	}
-}
 
-func (d *DialogMedia) ListenContext(ctx context.Context) error {
-	buf := make([]byte, media.RTPBufSize)
-	go func() {
-		<-ctx.Done()
-		d.mediaSession.StopRTP(2, 0)
-	}()
-	audioRader := d.getAudioReader()
-	for {
-		_, err := audioRader.Read(buf)
-		if err != nil {
-			return err
-		}
+	ringtone, err := audio.RingtoneLoadPCM(mprops.Codec)
+	if err != nil {
+		return AudioRingtone{}, err
 	}
+
+	encoder := audio.PCMEncoderWriter{}
+	if err := encoder.Init(mprops.Codec, w); err != nil {
+		return AudioRingtone{}, err
+	}
+
+	ar := AudioRingtone{
+		writer:       &encoder,
+		ringtone:     ringtone,
+		sampleSize:   mprops.Codec.Samples16(),
+		mediaSession: d.mediaSession,
+	}
+	return ar, nil
 }
 
-func (d *DialogMedia) ListenUntil(dur time.Duration) error {
-	buf := make([]byte, media.RTPBufSize)
+// AudioStereoRecordingCreate creates Stereo Recording audio Pipeline and stores as Wav file format
+// For audio to be recorded use AudioReader and AudioWriter from Recording
+//
+// Tips:
+// If you want to make permanent in audio pipeline use SetAudioReader, SetAudioWriter
+//
+// NOTE: API WILL change
+func (d *DialogMedia) AudioStereoRecordingCreate(wawFile *os.File) (AudioStereoRecordingWav, error) {
+	mpropsW := MediaProps{}
+	aw := d.audioWriterProps(&mpropsW)
+	if aw == nil {
+		return AudioStereoRecordingWav{}, fmt.Errorf("no media setup")
+	}
 
-	d.mediaSession.StopRTP(2, dur)
-	audioReader := d.getAudioReader()
+	mpropsR := MediaProps{}
+	ar := d.audioReaderProps(&mpropsR)
+	if ar == nil {
+		return AudioStereoRecordingWav{}, fmt.Errorf("no media setup")
+	}
+	codec := mpropsW.Codec
+	if mpropsR.Codec != mpropsW.Codec {
+		return AudioStereoRecordingWav{}, fmt.Errorf("codecs of reader and writer need to match for stereo")
+	}
+	// Create wav file to store recording
+	// Now create WavWriter to have Wav Container written
+	wavWriter := audio.NewWavWriter(wawFile)
+
+	mon := audio.MonitorPCMStereo{}
+	if err := mon.Init(wavWriter, codec, ar, aw); err != nil {
+		wavWriter.Close()
+		return AudioStereoRecordingWav{}, err
+	}
+
+	r := AudioStereoRecordingWav{
+		wawWriter: wavWriter,
+		mon:       mon,
+	}
+	return r, nil
+}
+
+// Listen keeps reading stream until it gets closed or deadlined
+// Use ListenBackground or ListenContext for better control
+func (d *DialogMedia) Listen() (err error) {
+	buf := make([]byte, media.RTPBufSize)
+	audioReader, err := d.AudioReader()
+	if err != nil {
+		return err
+	}
+
 	for {
 		_, err := audioReader.Read(buf)
 		if err != nil {
@@ -498,12 +625,92 @@ func (d *DialogMedia) ListenUntil(dur time.Duration) error {
 	}
 }
 
-func (d *DialogMedia) StopRTP(rw int8, dur time.Duration) {
-	d.mediaSession.StopRTP(rw, dur)
+// ListenBackground listens on stream in background and allows correct stoping of stream on network layer
+func (d *DialogMedia) ListenBackground() (stop func() error, err error) {
+	buf := make([]byte, media.RTPBufSize)
+	audioReader, err := d.AudioReader()
+	if err != nil {
+		return nil, err
+	}
+
+	wg := sync.WaitGroup{}
+	var readErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			_, err := audioReader.Read(buf)
+			if err != nil {
+				if err, ok := err.(net.Error); ok && err.Timeout() {
+					return
+				}
+				readErr = err
+				return
+			}
+		}
+	}()
+
+	return func() error {
+		if err := d.mediaSession.StopRTP(1, 0); err != nil {
+			return err
+		}
+		wg.Wait() // This makes sure we have exited reading
+		if err := d.mediaSession.StartRTP(1); err != nil {
+			return err
+		}
+		return readErr
+	}, nil
 }
 
-func (d *DialogMedia) StartRTP(rw int8, dur time.Duration) {
-	d.mediaSession.StartRTP(rw)
+// ListenContext listens until context is canceled.
+func (d *DialogMedia) ListenContext(pctx context.Context) error {
+	buf := make([]byte, media.RTPBufSize)
+	ctx, cancel := context.WithCancel(pctx)
+	defer cancel()
+
+	go func() {
+		<-ctx.Done()
+		if pctx.Err() != nil {
+			d.mediaSession.StopRTP(1, 0)
+		}
+	}()
+	audioReader, err := d.AudioReader()
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := audioReader.Read(buf)
+		if err != nil {
+			if err, ok := err.(net.Error); ok && err.Timeout() {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (d *DialogMedia) ListenUntil(dur time.Duration) error {
+	buf := make([]byte, media.RTPBufSize)
+
+	d.mediaSession.StopRTP(1, dur)
+	audioReader, err := d.AudioReader()
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := audioReader.Read(buf)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (d *DialogMedia) StopRTP(rw int8, dur time.Duration) error {
+	return d.mediaSession.StopRTP(rw, dur)
+}
+
+func (d *DialogMedia) StartRTP(rw int8, dur time.Duration) error {
+	return d.mediaSession.StartRTP(rw)
 }
 
 type DTMFReader struct {
@@ -515,8 +722,9 @@ type DTMFReader struct {
 // AudioReaderDTMF is DTMF over RTP. It reads audio and provides hook for dtmf while listening for audio
 // Use Listen or OnDTMF after this call
 func (m *DialogMedia) AudioReaderDTMF() *DTMFReader {
+	ar, _ := m.AudioReader()
 	return &DTMFReader{
-		dtmfReader:   media.NewRTPDTMFReader(media.CodecTelephoneEvent8000, m.RTPPacketReader, m.getAudioReader()),
+		dtmfReader:   media.NewRTPDTMFReader(media.CodecTelephoneEvent8000, m.RTPPacketReader, ar),
 		mediaSession: m.mediaSession,
 	}
 }
@@ -526,6 +734,9 @@ func (d *DTMFReader) Listen(onDTMF func(dtmf rune) error, dur time.Duration) err
 	buf := make([]byte, media.RTPBufSize)
 	for {
 		if _, err := d.readDeadline(buf, dur); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return nil
+			}
 			return err
 		}
 	}

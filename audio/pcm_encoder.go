@@ -4,10 +4,10 @@
 package audio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log/slog"
 	"sync"
 
 	"github.com/gluebag/diago/media"
@@ -174,6 +174,28 @@ func (d *PCMDecoderWriter) Write(b []byte) (n int, err error) {
 	return len(b), nil
 }
 
+type PCMDecoderBuffer struct {
+	buf *bytes.Buffer
+	PCMDecoderWriter
+}
+
+func (d *PCMDecoderBuffer) Init(codec media.Codec) error {
+	d.buf = bytes.NewBuffer(make([]byte, 0, codec.Samples16()))
+	return d.PCMDecoderWriter.Init(codec, d.buf)
+}
+
+func (d *PCMDecoderBuffer) ReadFull() []byte {
+	bytes := d.buf.Bytes()
+	d.buf.Reset()
+	return bytes
+}
+
+func (d *PCMDecoderBuffer) ReadAll() []byte {
+	bytes := d.buf.Bytes()
+	d.buf.Reset()
+	return bytes
+}
+
 type PCMEncoder struct {
 	EncoderTo func(encoded []byte, lpcm []byte) (int, error)
 
@@ -256,7 +278,7 @@ func (d *PCMEncoderWriter) Write(lpcm []byte) (int, error) {
 	// We need to have fixed frame sizes due to encoders
 	sampleSize := d.samplesSize
 	if len(lpcm) > sampleSize {
-		slog.Warn("Size of pcm samples does not match our frame", "lenpcm", len(lpcm), "expected", sampleSize)
+		media.DefaultLogger().Warn("Size of pcm samples does not match our frame", "lenpcm", len(lpcm), "expected", sampleSize)
 	}
 
 	// If encoder can not fit our network buffer it will error
@@ -266,7 +288,6 @@ func (d *PCMEncoderWriter) Write(lpcm []byte) (int, error) {
 		return n, err
 	}
 	encoded := d.buf[:n]
-	// fmt.Println("Writing lpcm, encoded", len(lpcm), len(encoded))
 
 	nn, err := d.Writer.Write(encoded)
 	if err != nil {

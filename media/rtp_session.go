@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -37,6 +36,9 @@ import (
 var (
 	DefaultOnReadRTCP  func(pkt rtcp.Packet, rtpStats RTPReadStats)  = nil
 	DefaultOnWriteRTCP func(pkt rtcp.Packet, rtpStats RTPWriteStats) = nil
+
+	// RTPSourceLock enables source locking after IP changes
+	RTPSourceLock bool
 )
 
 type RTPSession struct {
@@ -56,6 +58,11 @@ type RTPSession struct {
 	onWriteRTCP func(pkt rtcp.Packet, rtpStats RTPWriteStats)
 
 	closed bool
+
+	// sourceLock when enabled locks reading RTP packets into single source addr which handles security issue
+	sourceLock        bool
+	sourceLockPackets int
+	sourceLockAddr    *net.UDPAddr
 }
 
 // Some of fields here are exported (as readonly) intentionally
@@ -145,6 +152,7 @@ func NewRTPSession(sess *MediaSession) *RTPSession {
 		rtcpClosed:  make(chan struct{}),
 		onReadRTCP:  DefaultOnReadRTCP,
 		onWriteRTCP: DefaultOnWriteRTCP,
+		sourceLock:  RTPSourceLock,
 	}
 }
 
@@ -188,11 +196,16 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 
 		// Validate pkt. Check is it keep alive
 		if readPkt.Version == 0 {
-			slog.Debug("Received RTP with invalid version. Skipping")
+			DefaultLogger().Debug("Received RTP with invalid version. Skipping", "pkt.ssrc", readPkt.SSRC, "pkt.seq", readPkt.SequenceNumber)
 			continue
 		}
 		if len(readPkt.Payload) == 0 {
-			slog.Debug("Received RTP with empty Payload. Skipping")
+			DefaultLogger().Debug("Received RTP with empty Payload. Keep Alive? Skipping", "pkt.ssrc", readPkt.SSRC, "pkt.seq", readPkt.SequenceNumber)
+			continue
+		}
+
+		if s.sourceLock && !s.sourceLockProtection(readPkt, s.Sess.ReadRTPFromAddr) {
+			DefaultLogger().Debug("RTP Source lock protection learning. Skipping", "pkt.ssrc", readPkt.SSRC, "pkt.seq", readPkt.SequenceNumber)
 			continue
 		}
 
@@ -221,7 +234,7 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 			}
 
 			if codec.PayloadType != readPkt.PayloadType {
-				slog.Warn("Received RTP with unsupported payload_type", "pt", readPkt.PayloadType)
+				DefaultLogger().Warn("Received RTP with unsupported payload_type", "pt", readPkt.PayloadType)
 				return 0, nil
 			}
 		}
@@ -265,6 +278,38 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 	return n, err
 }
 
+// sourceLockProtection locks RTP handling only to one source change
+func (s *RTPSession) sourceLockProtection(pkt *rtp.Packet, from net.Addr) bool {
+	// TODO: Consider handling flood RTP protection
+	// RTP must be udp
+	fromAddr, ok := from.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+
+	if s.sourceLockAddr != nil {
+		return s.sourceLockAddr.IP.Equal(fromAddr.IP) && s.sourceLockAddr.Port == fromAddr.Port && s.sourceLockAddr.Zone == fromAddr.Zone
+	}
+
+	if s.readStats.lastSeq.seqNum+1 != pkt.SequenceNumber {
+		if s.readStats.lastSeq.seqNum != 0 {
+			// if not first packet then reset
+			s.sourceLockPackets = 0
+			return false
+		}
+	}
+
+	// We wait couple packets before considering this is right source
+	s.sourceLockPackets++
+	if s.sourceLockPackets < 4 {
+		// Not enough packets
+		return false
+	}
+
+	s.sourceLockAddr = fromAddr
+	return true
+}
+
 func (s *RTPSession) ReadRTPRaw(buf []byte) (int, error) {
 	// In this case just proxy RTP. RTP Session can not work without full RTP decoded
 	// It is expected that RTCP is also proxied
@@ -282,7 +327,18 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 	writeStats := &s.writeStats
 	// For now we only track latest SSRC
 	if writeStats.SSRC != pkt.SSRC {
-		codec := CodecFromPayloadType(pkt.PayloadType)
+		codec, err := func() (Codec, error) {
+			// Find codec from promoted list of codecs
+			for _, c := range s.Sess.Codecs {
+				if c.PayloadType == pkt.PayloadType {
+					return c, nil
+				}
+			}
+			return Codec{}, fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
+		}()
+		if err != nil {
+			return err
+		}
 
 		*writeStats = RTPWriteStats{
 			SSRC:       pkt.SSRC,
@@ -297,12 +353,6 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 
 	s.rtcpMU.Unlock()
 	return nil
-}
-
-func (s *RTPSession) WriteRTPRaw(buf []byte) (int, error) {
-	// In this case just proxy RTP. RTP Session can not work without full RTP decoded
-	// It is expected that RTCP is also proxied
-	return s.Sess.WriteRTCPRaw(buf)
 }
 
 func (s *RTPSession) ReadStats() RTPReadStats {
@@ -334,7 +384,7 @@ func (s *RTPSession) Monitor() error {
 		select {
 		case now = <-s.rtcpTicker.C:
 		case <-s.rtcpClosed:
-			slog.Debug("RTCP writer closed")
+			DefaultLogger().Debug("RTCP writer closed")
 			return nil
 		}
 		if err = s.writeRTCP(now); err != nil {
@@ -351,7 +401,7 @@ func (s *RTPSession) MonitorBackground() error {
 		return fmt.Errorf("raddr of RTP is not present. Is RemoteSDP called. Monitor RTP Session failed")
 	}
 
-	log := slog.Default()
+	log := DefaultLogger()
 	go func() {
 		sess := s.Sess
 		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())
@@ -406,7 +456,7 @@ func (s *RTPSession) readRTCP() error {
 		n, err := sess.ReadRTCP(buf, rtcpBuf)
 		if err != nil {
 			if errors.Is(err, errRTCPFailedToUnmarshal) {
-				slog.Error("RTCP Unmarshal error. Continue listen", "error", err)
+				DefaultLogger().Error("RTCP Unmarshal error. Continue listen", "error", err)
 				continue
 			}
 			return err
@@ -456,7 +506,7 @@ func (s *RTPSession) readRTCPPacket(pkt rtcp.Packet) {
 func (s *RTPSession) readReceptionReport(rr rtcp.ReceptionReport, now time.Time) {
 	// For now only use single SSRC
 	if rr.SSRC != s.writeStats.SSRC {
-		slog.Warn("Reception report SSRC does not match our internal", "ssrc", rr.SSRC, "expected", s.writeStats.SSRC)
+		DefaultLogger().Warn("Reception report SSRC does not match our internal", "ssrc", rr.SSRC, "expected", s.writeStats.SSRC)
 		return
 	}
 
@@ -467,7 +517,7 @@ func (s *RTPSession) readReceptionReport(rr rtcp.ReceptionReport, now time.Time)
 		var skewed bool
 		s.readStats.RTT, skewed = calcRTT(now, rr.LastSenderReport, rr.Delay)
 		if skewed {
-			slog.Warn("Internal RTCP clock skew detected", "ssrc", rr.SSRC, "rtt", s.readStats.RTT.String())
+			DefaultLogger().Warn("Internal RTCP clock skew detected", "ssrc", rr.SSRC, "rtt", s.readStats.RTT.String())
 		}
 	}
 	// used to calc fraction lost

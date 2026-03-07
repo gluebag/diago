@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -17,13 +18,17 @@ import (
 	"github.com/gluebag/sipgo/sip"
 )
 
+var (
+	ErrClientEarlyMedia = errors.New("Early media detected")
+)
+
 // DialogClientSession represents outbound channel
 type DialogClientSession struct {
 	*sipgo.DialogClientSession
 
 	DialogMedia
 
-	onReferDialog func(referDialog *DialogClientSession)
+	onReferDialog OnReferDialogFunc
 
 	closed atomic.Uint32
 }
@@ -43,6 +48,46 @@ func (d *DialogClientSession) Id() string {
 
 func (d *DialogClientSession) Hangup(ctx context.Context) error {
 	return d.Bye(ctx)
+}
+
+// SendCancelRequestV2Glue builds and sends a CANCEL for the current INVITE dialog.
+// It constructs the CANCEL request internally per RFC 3261 Section 9.1, matching
+// the original INVITE's Via, From, To, CallID, and Route headers.
+func (d *DialogClientSession) SendCancelRequestV2Glue(ctx context.Context) error {
+	if d.InviteResponse == nil {
+		return fmt.Errorf("cannot send CANCEL: no response received yet for INVITE")
+	}
+
+	if !d.InviteResponse.IsProvisional() {
+		return fmt.Errorf("cannot send CANCEL: response is not provisional (status: %d)", d.InviteResponse.StatusCode)
+	}
+
+	dialogState := d.DialogSIP().LoadState()
+	if dialogState == sip.DialogStateConfirmed {
+		return fmt.Errorf("cannot send CANCEL: dialog already confirmed")
+	}
+	if dialogState == sip.DialogStateEnded {
+		return fmt.Errorf("cannot send CANCEL: dialog already ended")
+	}
+
+	// Build CANCEL from INVITE per RFC 3261 Section 9.1
+	cancelReq := sip.NewRequest(sip.CANCEL, d.InviteRequest.Recipient)
+	cancelReq.AppendHeader(sip.HeaderClone(d.InviteRequest.Via()))
+	cancelReq.AppendHeader(sip.HeaderClone(d.InviteRequest.From()))
+	cancelReq.AppendHeader(sip.HeaderClone(d.InviteRequest.To()))
+	cancelReq.AppendHeader(sip.HeaderClone(d.InviteRequest.CallID()))
+	sip.CopyHeaders("Route", d.InviteRequest, cancelReq)
+	cancelReq.SetSource(d.InviteRequest.Source())
+	cancelReq.Laddr = d.InviteRequest.Laddr
+
+	res, err := d.Do(ctx, cancelReq)
+	if err != nil {
+		return fmt.Errorf("CANCEL request failed: %w", err)
+	}
+	if res.StatusCode != 200 {
+		return sipgo.ErrDialogResponse{Res: res}
+	}
+	return nil
 }
 
 // SendCancelRequest sends custom CANCEL request made outside the current dialog
@@ -110,9 +155,9 @@ func (d *DialogClientSession) RemoteContact() *sip.ContactHeader {
 }
 
 func (d *DialogClientSession) remoteContactUnsafe() *sip.ContactHeader {
-	if d.lastInvite != nil {
+	if d.remoteContactTarget != nil {
 		// Invite update can change contact
-		return d.lastInvite.Contact()
+		return d.remoteContactTarget
 	}
 	return d.InviteResponse.Contact()
 }
@@ -121,15 +166,24 @@ func (d *DialogClientSession) remoteContactUnsafe() *sip.ContactHeader {
 type InviteClientOptions struct {
 	Originator DialogSession
 	OnResponse func(res *sip.Response) error
-	// OnMediaUpdate called when media is changed. NOTE: you should not block this call
+	// OnMediaUpdate called when media is changed.
+	// NOTE: you should not block this call as it blocks response processing.
 	OnMediaUpdate func(d *DialogMedia)
-	OnRefer       func(referDialog *DialogClientSession)
+	// OnRefer is called on successfull REFER handling
+	//
+	// It creates new dialog (NewDialog) on which you need to call Invite() and Ack()
+	// Any error from invite, ack or other processing should be returned for correct Notify handling
+	//
+	// NOTE: IT is SCOPED to handler and exiting handler will Close/Terminate this dialog!
+	OnRefer OnReferDialogFunc
 	// For digest authentication
 	Username string
 	Password string
 
 	// Custom headers to pass. DO NOT SET THIS to nil
 	Headers []sip.Header
+	// Stop on early media. ErrClientEarlyMedia will be returned
+	EarlyMediaDetect bool
 }
 
 // WithAnonymousCaller sets from user Anonymous per RFC
@@ -150,8 +204,20 @@ func (o *InviteClientOptions) WithCaller(displayName string, callerID string, ho
 	})
 }
 
-// Invite sends Invite request and establishes early media.
-// NOTE: You must call Ack after to acknowledge session.
+// Invite sends Invite request and establishes [early] media. Normally you need to call Ack after.
+//
+// Normal Answer with 200 OK (SDP)
+// - You MUST call Ack() after to acknowledge session.
+//
+// Early Media Detect:
+// - It RETURNS ErrClientEarlyMedia if remote answers with 183 Session in Progress
+// - Media is negotiated and setuped
+// - You need to call WaitAnswer() if you want to proceed with answering call
+//
+// Errors:
+// - sipgo.ErrDialogResponse
+// - ErrClientEarlyMedia
+//
 // NOTE: It updates internal invite request so NOT THREAD SAFE.
 // If you pass originator it will use originator to set correct from header and avoid media transcoding
 //
@@ -196,7 +262,12 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 			audioCodec := media.Codec{}
 			telEventCodec := media.Codec{}
 
-			for _, c := range sess.Codecs {
+			codecs := sess.CommonCodecs()
+			if len(codecs) == 0 { // No negotiation yet happened
+				codecs = sess.Codecs
+			}
+
+			for _, c := range codecs {
 				// TODO refactor this
 				if strings.HasPrefix(c.Name, "telephone-event") {
 					if telEventCodec.SampleRate == 0 {
@@ -210,7 +281,8 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 				}
 			}
 			// TODO: DO we need to be thread safe here?
-			// TODO: Should we honor formats set on this session?
+			// In this case we want to rewrite what should be Offered in our SDP
+			// NOTE: Generally this would require Session Fork, but for now we avoid this extra step.
 			sessCodecs := sess.Codecs[:0]
 			if audioCodec.SampleRate != 0 {
 				sessCodecs = append(sessCodecs, audioCodec)
@@ -234,8 +306,9 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 	inviteReq.SetBody(sess.LocalSDP())
 
 	// We allow changing full from header, but we need to make sure it is correctly set
-	if fromHDR := inviteReq.From(); fromHDR != nil {
-		fromHDR.Params["tag"] = sip.GenerateTagN(16)
+	// If users specify 'tag' parameter it is assumed that they know what they do
+	if fromHDR := inviteReq.From(); fromHDR != nil && !fromHDR.Params.Has("tag") {
+		fromHDR.Params.Add("tag", sip.GenerateTagN(16))
 	}
 
 	// Build here request
@@ -246,6 +319,7 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 
 	// This only gets called after session established
 	d.OnMediaUpdate = opts.OnMediaUpdate
+	d.onReferDialog = opts.OnRefer
 	// reuse UDP listener
 	// Problem if listener is unspecified IP sipgo will not map this to listener
 	// Code below only works if our bind host is specified
@@ -261,24 +335,82 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 		// sess.Close()
 		return err
 	}
-
-	return d.waitAnswer(ctx, sipgo.AnswerOptions{
+	ansOpts := sipgo.AnswerOptions{
 		Username:   opts.Username,
 		Password:   opts.Password,
 		OnResponse: opts.OnResponse,
-	})
+	}
+
+	if opts.EarlyMediaDetect {
+		return d.waitAnswerEarly(ctx, ansOpts)
+	}
+
+	return d.waitAnswer(ctx, ansOpts)
 }
 
-// InviteLate does not send SDP offer
-// NOTE: call AckLate to complete negotiation
-// func (d *DialogClientSession) InviteLate(ctx context.Context, opts InviteOptions) error {
+// WaitAnswer waits dialog on answer. It should only be used if you have error Invite but still want to continue
+// ex. ErrClientEarlyMedia was returned but you want to proceed with answering
+func (d *DialogClientSession) WaitAnswer(ctx context.Context, opts sipgo.AnswerOptions) error {
+	return d.waitAnswer(ctx, opts)
+}
 
-// }
+func (d *DialogClientSession) waitAnswerEarly(ctx context.Context, opts sipgo.AnswerOptions) error {
+	sess := d.mediaSession
+	onResps := opts.OnResponse
+
+	// Add early media check
+	opts.OnResponse = func(res *sip.Response) error {
+		// https://datatracker.ietf.org/doc/html/rfc3261#section-8.1.3.2
+		// 		UAC MUST treat any provisional response different than 100 that it
+		//    does not recognize as 183 (Session Progress).
+		// Check any existing
+		if onResps != nil {
+			if err := onResps(res); err != nil {
+				return err
+			}
+		}
+
+		// handle 183 Session Progress early media
+		if res.StatusCode != sip.StatusSessionInProgress {
+			return nil
+		}
+
+		if cont := res.ContentType(); cont == nil || cont.Value() != "application/sdp" {
+			return nil
+		}
+
+		remoteSDP := res.Body()
+		if remoteSDP == nil {
+			return nil
+		}
+		if err := sess.RemoteSDP(remoteSDP); err != nil {
+			return err
+		}
+
+		if err := sess.Finalize(); err != nil {
+			return err
+		}
+
+		rtpSess := media.NewRTPSession(sess)
+		d.mu.Lock()
+		d.initRTPSessionUnsafe(sess, rtpSess)
+		d.onCloseUnsafe(func() error {
+			return rtpSess.Close()
+		})
+		d.mu.Unlock()
+
+		// Must be called after reader and writer setup due to race
+		if err := rtpSess.MonitorBackground(); err != nil {
+			return err
+		}
+
+		return ErrClientEarlyMedia
+	}
+	return d.waitAnswer(ctx, opts)
+}
 
 func (d *DialogClientSession) waitAnswer(ctx context.Context, opts sipgo.AnswerOptions) error {
-	sess := d.mediaSession
-
-	if err := d.WaitAnswer(ctx, opts); err != nil {
+	if err := d.DialogClientSession.WaitAnswer(ctx, opts); err != nil {
 		return err
 	}
 
@@ -286,65 +418,62 @@ func (d *DialogClientSession) waitAnswer(ctx context.Context, opts sipgo.AnswerO
 	if remoteSDP == nil {
 		return fmt.Errorf("no SDP in response")
 	}
-	if err := sess.RemoteSDP(remoteSDP); err != nil {
-		return err
+
+	if err := d.applyRemoteSDP(remoteSDP); err != nil {
+		// Terminate call. Call must be ACK before doing BYE
+		if err := d.Ack(ctx); err != nil {
+			return errors.Join(err, d.Ack(ctx))
+		}
+		return errors.Join(err, d.Bye(ctx))
 	}
 
-	// Create RTP session. After this no media session configuration should be changed
-	rtpSess := media.NewRTPSession(sess)
-	d.mu.Lock()
-	d.initRTPSessionUnsafe(sess, rtpSess)
-	d.onCloseUnsafe(func() error {
-		return rtpSess.Close()
-	})
-	d.mu.Unlock()
-
-	// Must be called after reader and writer setup due to race
-	if err := rtpSess.MonitorBackground(); err != nil {
-		return err
-	}
 	return nil
 }
 
-func (d *DialogClientSession) HandleEarlyMediaSDP(res *sip.Response) (*media.RTPSession, error) {
+func (d *DialogClientSession) applyRemoteSDP(remoteSDP []byte) error {
 	sess := d.mediaSession
 
-	remoteSDP := res.Body()
-	if remoteSDP == nil {
-		return nil, fmt.Errorf("no SDP in response")
+	// Apply SDP on existing (Early) media if it exists
+	if err := d.checkEarlyMedia(remoteSDP); err != errNoRTPSession {
+		return err
 	}
 	if err := sess.RemoteSDP(remoteSDP); err != nil {
-		return nil, err
+		return err
 	}
-
-	// Check if rtp session already exists
-	d.mu.Lock()
-	if rtpSess := d.rtpSession; rtpSess != nil {
-		d.mu.Unlock()
-		return rtpSess, nil
-	}
-	d.mu.Unlock()
 
 	// Create RTP session. After this no media session configuration should be changed
 	rtpSess := media.NewRTPSession(sess)
 	d.mu.Lock()
 	d.initRTPSessionUnsafe(sess, rtpSess)
-	d.onCloseUnsafe(func() error {
-		return rtpSess.Close()
-	})
+	// d.onCloseUnsafe(func() error {
+	// 	return rtpSess.Close()
+	// })
 	d.mu.Unlock()
 
 	// Must be called after reader and writer setup due to race
-	if err := rtpSess.MonitorBackground(); err != nil {
-		return nil, err
-	}
-	return rtpSess, nil
+	return rtpSess.MonitorBackground()
 }
 
 // Ack acknowledgeds media
 // Before Ack normally you want to setup more stuff like bridging
 func (d *DialogClientSession) Ack(ctx context.Context) error {
-	return d.ack(ctx, nil)
+	inviteRequest := d.InviteRequest
+	recipient := inviteRequest.Recipient
+	if contact := d.InviteResponse.Contact(); contact != nil {
+		recipient = contact.Address
+	}
+
+	if err := d.ack(ctx, recipient, nil); err != nil {
+		return err
+	}
+
+	// NOTE it generally advisable todo this after successfull ACK:
+	// Server may not even listen yet as it is waiting for ACK
+	if err := d.mediaSession.Finalize(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // AckLate sends ACK with media. Use this in combination with late(delay) offer
@@ -352,15 +481,15 @@ func (d *DialogClientSession) Ack(ctx context.Context) error {
 // 	return d.ack(ctx, d.mediaSession.LocalSDP())
 // }
 
-func (d *DialogClientSession) ack(ctx context.Context, body []byte) error {
-	inviteRequest := d.InviteRequest
-	recipient := &inviteRequest.Recipient
-	if contact := d.InviteResponse.Contact(); contact != nil {
-		recipient = &contact.Address
-	}
+func (d *DialogClientSession) ack(ctx context.Context, remoteTarget sip.Uri, body []byte) error {
+	// inviteRequest := d.InviteRequest
+	// recipient := &inviteRequest.Recipient
+	// if contact := d.InviteResponse.Contact(); contact != nil {
+	// 	recipient = &contact.Address
+	// }
 	ackRequest := sip.NewRequest(
 		sip.ACK,
-		*recipient.Clone(),
+		remoteTarget,
 	)
 
 	if body != nil {
@@ -394,15 +523,9 @@ func (d *DialogClientSession) ReInvite(ctx context.Context) error {
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	req.SetBody(sdp)
 
-	res, err := d.Do(ctx, req)
+	res, err := d.reInviteDo(ctx, req)
 	if err != nil {
 		return err
-	}
-
-	if !res.IsSuccess() {
-		return sipgo.ErrDialogResponse{
-			Res: res,
-		}
 	}
 
 	cont := res.Contact()
@@ -414,11 +537,131 @@ func (d *DialogClientSession) ReInvite(ctx context.Context) error {
 	return d.WriteRequest(ack)
 }
 
-// Refer tries todo refer (blind transfer) on call
-// TODO: not complete
-func (d *DialogClientSession) Refer(ctx context.Context, referTo sip.Uri) error {
-	cont := d.InviteResponse.Contact()
-	return dialogRefer(ctx, d, cont.Address, referTo)
+func (d *DialogClientSession) reInviteDo(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+
+	for {
+		res, err := d.Do(ctx, req.Clone())
+		if err != nil {
+			return nil, err
+		}
+
+		if !res.IsSuccess() {
+			// https://datatracker.ietf.org/doc/html/rfc3261#section-14.1
+			// If a UAC receives a 491 response to a re-INVITE, it SHOULD start a
+			//    timer with a value T chosen as follows:
+			//       1. If the UAC is the owner of the Call-ID of the dialog ID
+			//          (meaning it generated the value), T has a randomly chosen value
+			//          between 2.1 and 4 seconds in units of 10 ms.
+
+			//       2. If the UAC is not the owner of the Call-ID of the dialog ID, T
+			//          has a randomly chosen value of between 0 and 2 seconds in units
+			//          of 10 ms.
+
+			if res.StatusCode == sip.StatusRequestPending {
+				select {
+				case <-time.After(time.Duration(2000+mrand.IntN(200)*10) * time.Millisecond):
+					continue
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+
+			return nil, sipgo.ErrDialogResponse{
+				Res: res,
+			}
+		}
+
+		// Now do ACK on new Contact
+		if err := d.ack(ctx, res.Contact().Address, nil); err != nil {
+			return res, err
+		}
+
+		return res, nil
+	}
+}
+
+// reInviteMediaSession updates with full new media session
+// media MUST BE Forked
+func (d *DialogClientSession) reInviteMediaSession(ctx context.Context, ms *media.MediaSession) error {
+	sdp := ms.LocalSDP()
+
+	// NOTE: we do not change original invite request
+	d.mu.Lock()
+	contact := d.remoteContactUnsafe()
+	d.mu.Unlock()
+
+	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req.AppendHeader(d.InviteRequest.Contact())
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody(sdp)
+
+	res, err := d.reInviteDo(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	// Save new remote target contact and update media
+	return func() error {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.remoteContactTarget = res.Contact()
+
+		remoteSDP := res.Body()
+		if err := ms.RemoteSDP(remoteSDP); err != nil {
+			return fmt.Errorf("sdp update media remote SDP applying failed: %w", err)
+		}
+
+		return d.mediaUpdateUnsafe(ms)
+	}()
+}
+
+// reInvites withs empty SDP are way to keep alive or do some post media update after receiving offer on 2xx
+func (d *DialogClientSession) reInviteKeepAlive(ctx context.Context) error {
+	// NOTE: we do not change original invite request
+	d.mu.Lock()
+	contact := d.remoteContactUnsafe()
+	d.mu.Unlock()
+
+	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req.AppendHeader(d.InviteRequest.Contact())
+
+	res, err := d.reInviteDo(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	// Save new remote target contact
+	d.mu.Lock()
+	d.remoteContactTarget = res.Contact()
+	d.mu.Unlock()
+
+	return nil
+}
+
+// Refer tries todo refer (blind transfer) on call. For more control use ReferOptions
+//
+// NOTE: It is expected that after calling this you are hanguping call to send BYE
+func (d *DialogClientSession) Refer(ctx context.Context, referTo sip.Uri, headers ...sip.Header) error {
+	// cont := d.InviteRequest.Contact()
+	// return dialogRefer(ctx, d, cont.Address, referTo, headers...)
+	return d.ReferOptions(ctx, referTo, ReferClientOptions{
+		Headers: headers,
+	})
+}
+
+type ReferClientOptions struct {
+	Headers  []sip.Header
+	OnNotify func(statusCode int)
+}
+
+func (d *DialogClientSession) ReferOptions(ctx context.Context, referTo sip.Uri, opts ReferClientOptions) error {
+	d.mu.Lock()
+	cont := d.remoteContactUnsafe()
+	if opts.OnNotify != nil {
+		d.onReferNotify = opts.OnNotify
+	}
+	d.mu.Unlock()
+	return dialogRefer(ctx, d, cont.Address, referTo, d.InviteResponse.Contact().Address, opts.Headers...)
 }
 
 func (d *DialogClientSession) handleReferNotify(req *sip.Request, tx sip.ServerTransaction) {
@@ -443,6 +686,27 @@ func (d *DialogClientSession) handleReInvite(req *sip.Request, tx sip.ServerTran
 	}
 
 	return d.handleMediaUpdate(req, tx, d.InviteRequest.Contact())
+}
+
+func (d *DialogClientSession) handleReInviteACK(req *sip.Request, tx sip.ServerTransaction) error {
+	// Check do we need to handle Late Offer from ACK and update media
+	body := req.Body()
+	if body != nil {
+		// Update media session state under lock, but invoke the app callback after unlock to avoid deadlocks.
+		d.mu.Lock()
+		err := d.sdpUpdateUnsafe(body)
+		onMediaUpdate := d.OnMediaUpdate
+		d.mu.Unlock()
+		if err != nil {
+			return err
+		}
+
+		if onMediaUpdate != nil {
+			onMediaUpdate(d.Media())
+		}
+	}
+
+	return d.mediaSession.Finalize()
 }
 
 func (d *DialogClientSession) readSIPInfoDTMF(req *sip.Request, tx sip.ServerTransaction) error {

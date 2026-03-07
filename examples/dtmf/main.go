@@ -43,9 +43,11 @@ func start(ctx context.Context) error {
 }
 
 func ReadDTMF(inDialog *diago.DialogServerSession) error {
-	inDialog.Progress() // Progress -> 100 Trying
-	inDialog.Ringing()  // Ringing -> 180 Response
-	inDialog.Answer()
+	inDialog.Trying()  // Progress -> 100 Trying
+	inDialog.Ringing() // Ringing -> 180 Response
+	if err := inDialog.Answer(); err != nil {
+		return err
+	}
 	slog.Info("Reading DTMF")
 
 	reader := inDialog.AudioReaderDTMF()

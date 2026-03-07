@@ -1,4 +1,4 @@
-<img src="icons/diago-text.png" width="300" alt="DIAGO">
+<img src="icons/diago-icon-text.svg" width="300" alt="DIAGO">
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/emiago/diago)](https://goreportcard.com/report/github.com/emiago/diago)
 ![Coverage](https://img.shields.io/badge/coverage-61.1%25-blue)
@@ -7,7 +7,7 @@
 Short of **dialog + GO**.  
 **Library for building VOIP solutions in GO!**
 
-Built on top of optimized [SIPgo library]((https://emiago.github.io/diago))!  
+Built on top of optimized [SIPgo library](https://github.com/emiago/sipgo)!  
 In short it allows developing fast and easy testable VOIP apps to handle calls, registrations and more... 
 
 *Diago is mainly project driven lib, so lot of API design will/should be challenged with real working apps needs*
@@ -19,11 +19,16 @@ Quick links:
 - [Demo Examples](https://emiago.github.io/diago/docs/examples/)
 - [API Docs](https://emiago.github.io/diago/docs/api_docs/)
 - [GO Docs](https://pkg.go.dev/github.com/emiago/diago)
+- [Roadmap](https://emiago.github.io/diago/docs/#core-roadmap)
 
 *If you find this project useful and you want to support/sponzor or need help with your projects, you can contact me more on*
 [mail](mailto:emirfreelance91@gmail.com).
 
 Follow me on [X/Twitter](https://twitter.com/emiago123) for regular updates
+
+**Tools/Service developed with diago:**
+- <img width="20" src="https://github.com/emiago/diagox/raw/main/images/diagox-icon-blue.png"> [github.com/emiago/diagox](https://github.com/emiago/diagox) simple Ingress/Egress and Registrar for SIP/RTP scaling
+- <img width="20" src="https://github.com/emiago/gophone/raw/main/images/g2.png"> [github.com/emiago/gophone](https://github.com/emiago/gophone) CLI softphone for easy testing 
 
 ## RFCS
 
@@ -38,11 +43,19 @@ RTP/AVP:
 [RFC3550](https://datatracker.ietf.org/doc/html/rfc3550)
 > RTP Packetizers, Media Forking, RTP Session control, RTCP Sender/Receiver reports, RTCP statistics tracking, DTMF reader/writer ...
 
-NOTE: For specifics and questions what is covered by RFC, please open Issue. Note lot of functionality can be extended even if not built in library. 
+
+REFER:
+- [RFC3515](https://datatracker.ietf.org/doc/html/rfc3515)
+- [RFC3892](https://datatracker.ietf.org/doc/html/rfc3892)
+
+**NOTE**: For specifics and questions what is covered by RFC, please open Issue. Lot of functionality can be extended even if not built in library. 
 
 ## Contributions
-Please open first issues instead PRs. Library is under development and could not have latest code pushed.
 
+Please avoid following:
+- Creating BIG PR that creates feature or lot of refactoring without previously having Issue. Issue should explain problem or requirements you want to accomplish.
+- Creating Change Log or some other textual files that add some sort of documentation. This is why we need Issue and ID of issue should be in your commit. If you want(think it is good) to have this better documented(like webpage or readme) pls open issue.
+- English is main language for code and for comments. Any other language used PRs will be rejected.
 
 ## Usage 
 
@@ -52,8 +65,8 @@ ua, _ := sipgo.NewUA()
 dg := diago.NewDiago(ua)
 
 dg.Serve(ctx, func(inDialog *diago.DialogServerSession) {
-	inDialog.Progress() // Progress -> 100 Trying
-	inDialog.Answer(); // Answer
+	inDialog.Trying() // 100 Trying
+	inDialog.Answer(); // Answer - 200 OK SDP
 
 	// Make sure file below exists in work dir
 	playfile, err := os.Open("demo-echotest.wav")

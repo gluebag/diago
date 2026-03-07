@@ -30,6 +30,25 @@ func (e RegisterResponseError) Error() string {
 	return e.Msg
 }
 
+type RegisterOptions struct {
+	// Digest auth
+	Username  string
+	Password  string
+	ProxyHost string
+
+	// Expiry is for Expire header
+	Expiry time.Duration
+	// Retry interval is interval before next Register is sent
+	RetryInterval time.Duration
+	AllowHeaders  []string
+
+	OnRegistered func()
+
+	// Useragent default will be used on what is provided as NewUA()
+	// UserAgent         string
+	// UserAgentHostname string
+}
+
 type RegisterTransaction struct {
 	opts   RegisterOptions
 	Origin *sip.Request
@@ -40,7 +59,7 @@ type RegisterTransaction struct {
 	expiry time.Duration
 }
 
-func newRegisterTransaction(client *sipgo.Client, recipient sip.Uri, contact sip.ContactHeader, opts RegisterOptions) *RegisterTransaction {
+func newRegisterTransaction(client *sipgo.Client, recipient sip.Uri, contact sip.ContactHeader, log *slog.Logger, opts RegisterOptions) *RegisterTransaction {
 	expiry, allowHDRS := opts.Expiry, opts.AllowHeaders
 	// log := p.getLoggerCtx(ctx, "Register")
 	req := sip.NewRequest(sip.REGISTER, recipient)
@@ -69,31 +88,31 @@ func newRegisterTransaction(client *sipgo.Client, recipient sip.Uri, contact sip
 		Origin: req, // origin maybe updated after first register
 		opts:   opts,
 		client: client,
-		log:    slog.Default().With("caller", "Register"),
+		log:    log.With("caller", "Register"),
 	}
 
 	return t
 }
 
 func (t *RegisterTransaction) Register(ctx context.Context) error {
-	username, password, expiry := t.opts.Username, t.opts.Password, t.opts.Expiry
+	if err := t.register(ctx); err != nil {
+		return err
+	}
+
+	if t.opts.OnRegistered != nil {
+		t.opts.OnRegistered()
+	}
+	return nil
+}
+func (t *RegisterTransaction) register(ctx context.Context) error {
+	username, password := t.opts.Username, t.opts.Password
 	client := t.client
-	log := t.log
 	req := t.Origin
 	contact := *req.Contact().Clone()
 
-	// Send request and parse response
-	// req.SetDestination(*dst)
-	log.Info("REGISTER", "uri", req.Recipient.String(), "expiry", int(expiry))
-	tx, err := client.TransactionRequest(ctx, req, sipgo.ClientRequestRegisterBuild)
+	res, err := client.Do(ctx, req, sipgo.ClientRequestRegisterBuild)
 	if err != nil {
 		return fmt.Errorf("fail to create transaction req=%q: %w", req.StartLine(), err)
-	}
-	defer tx.Terminate()
-
-	res, err := getResponse(ctx, tx)
-	if err != nil {
-		return fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
 	}
 
 	via := res.Via()
@@ -116,11 +135,7 @@ func (t *RegisterTransaction) Register(ctx context.Context) error {
 		req.ReplaceHeader(&contact)
 	}
 
-	log.Info("Received status", "status", int(res.StatusCode))
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
-		tx.Terminate() //Terminate previous
-
-		log.Info("Unathorized. Doing digest auth")
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 			Username: username,
 			Password: password,
@@ -128,7 +143,6 @@ func (t *RegisterTransaction) Register(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
 		}
-		log.Info("Received status", "status", int(res.StatusCode))
 	}
 
 	if res.StatusCode != 200 {
@@ -144,7 +158,7 @@ func (t *RegisterTransaction) Register(ctx context.Context) error {
 	if h := res.GetHeader("Expires"); h != nil {
 		val, err := strconv.Atoi(h.Value())
 		if err != nil {
-			return fmt.Errorf("Failed to parse server Expires value: %w", err)
+			return fmt.Errorf("failed to parse server Expires value: %w", err)
 		}
 		t.expiry = time.Duration(val) * time.Second
 	}
@@ -155,34 +169,22 @@ func (t *RegisterTransaction) Register(ctx context.Context) error {
 func (t *RegisterTransaction) QualifyLoop(ctx context.Context) error {
 	// TODO: based on server response Expires header this must be adjusted
 	// Allows caller to adjust
-
-	calcRetry := func(expiry time.Duration) time.Duration {
-		// Allow caller to use own interval
-		if t.opts.RetryInterval != 0 {
-			return t.opts.RetryInterval
-		}
-
-		calc := expiry.Seconds() * 0.75
-		retry := time.Duration(calc) * time.Second
-
-		// Set to 30 in case retry is not set
-		if retry == 0 {
-			retry = 30 * time.Second
-		}
-
-		return retry
-	}
-
 	expiry := t.expiry
-	retry := calcRetry(expiry)
+	retry := t.calcRetry(expiry)
+	return t.reregisterLoop(ctx, retry)
+}
 
+func (t *RegisterTransaction) reregisterLoop(ctx context.Context, retry time.Duration) error {
 	ticker := time.NewTicker(retry)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C: // TODO make configurable
 		}
+		expiry := t.expiry
 		err := t.Qualify(ctx)
 		if err != nil {
 			return err
@@ -191,13 +193,29 @@ func (t *RegisterTransaction) QualifyLoop(ctx context.Context) error {
 		if t.expiry != expiry {
 			// expiry got updated
 			expiry = t.expiry
-			retry = calcRetry(expiry)
+			retry = t.calcRetry(expiry)
 
 			t.log.Info("Register expiry changed", "expiry_old", expiry, "expiry_new", t.expiry, "retry", retry)
 			ticker.Reset(retry)
 		}
-
 	}
+}
+
+func (t *RegisterTransaction) calcRetry(expiry time.Duration) time.Duration {
+	// Allow caller to use own interval
+	if t.opts.RetryInterval != 0 {
+		return t.opts.RetryInterval
+	}
+
+	calc := expiry.Seconds() * 0.75
+	retry := time.Duration(calc) * time.Second
+
+	// Set to 30 in case retry is not set
+	if retry == 0 {
+		retry = 30 * time.Second
+	}
+
+	return retry
 }
 
 func (t *RegisterTransaction) Unregister(ctx context.Context) error {
@@ -217,7 +235,6 @@ func (t *RegisterTransaction) Qualify(ctx context.Context) error {
 
 func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) error {
 	// log := p.getLoggerCtx(ctx, "Register")
-	log := t.log
 	client := t.client
 	username, password := t.opts.Username, t.opts.Password
 	// Send request and parse response
@@ -228,9 +245,7 @@ func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) e
 		return fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
 	}
 
-	log.Info("Received status", "uri", req.Recipient.String())
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
-		log.Info("Unathorized. Doing digest auth")
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 			Username: username,
 			Password: password,
@@ -238,7 +253,6 @@ func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) e
 		if err != nil {
 			return fmt.Errorf("fail to get response req=%q : %w", req.StartLine(), err)
 		}
-		log.Info("Received status", "uri", req.Recipient.String())
 	}
 
 	if res.StatusCode != 200 {

@@ -22,6 +22,14 @@ var bufReader = sync.Pool{
 	},
 }
 
+const (
+	// https://datatracker.ietf.org/doc/html/rfc4566#section-6
+	ModeRecvonly string = "recvonly"
+	ModeSendrecv string = "sendrecv"
+	ModeSendonly string = "sendonly"
+	ModeInactive string = "inactive"
+)
+
 type SessionDescription map[string][]string
 
 func (sd SessionDescription) Values(key string) []string {
@@ -61,8 +69,11 @@ func (m *MediaDescription) String() string {
 
 func (sd SessionDescription) MediaDescription(mediaType string) (MediaDescription, error) {
 	values := sd.Values("m")
-
 	md := MediaDescription{}
+	if len(values) > 1 {
+		return md, fmt.Errorf("more than 1 media line for type %q", mediaType)
+	}
+
 	var v string
 	for _, val := range values {
 		ind := strings.Index(val, " ")
@@ -125,12 +136,12 @@ func (sd SessionDescription) ConnectionInformation() (ci ConnectionInformation, 
 	case "IP4":
 		ci.IP = ci.IP.To4()
 		if ci.IP == nil {
-			return ci, fmt.Errorf("failed to convert to IP4")
+			return ci, fmt.Errorf("sdp - failed to convert to IP4 c=%s", v)
 		}
 	case "IP6":
 		ci.IP = ci.IP.To16()
 		if ci.IP == nil {
-			return ci, fmt.Errorf("failed to convert to IP4")
+			return ci, fmt.Errorf("sdp - failed to convert to IP6 c=%s", v)
 		}
 	}
 
@@ -142,6 +153,56 @@ func (sd SessionDescription) ConnectionInformation() (ci ConnectionInformation, 
 		ci.Range, _ = strconv.Atoi(addr[2])
 	}
 	return ci, nil
+}
+
+type SessionInformation struct {
+	Origin         string
+	SessionID      uint64
+	SessionVersion uint64
+	NetworkType    string
+	AddressType    string
+	Address        string // Informational address
+}
+
+func (sd SessionDescription) SessionInformation() (i SessionInformation, err error) {
+	v := sd.Value("o")
+	if v == "" {
+		return i, fmt.Errorf("Connection information does not exists")
+	}
+	fields := strings.Fields(v)
+	if len(fields) < 6 {
+		return i, fmt.Errorf("Not enough session fields")
+	}
+	i.Origin = fields[0]
+	sessId, sessVersion := fields[1], fields[2]
+	i.SessionID, err = strconv.ParseUint(sessId, 10, 64)
+	if err != nil {
+		return i, err
+	}
+	i.SessionVersion, err = strconv.ParseUint(sessVersion, 10, 64)
+	if err != nil {
+		return i, err
+	}
+	i.NetworkType = fields[3]
+	i.AddressType = fields[4]
+	i.Address = fields[5]
+	return i, nil
+}
+
+func (sd SessionDescription) MediaDirection() string {
+	attrs := sd.Values("a")
+	if attrs == nil {
+		// Assume default per
+		return ModeSendrecv
+	}
+	mode := ModeSendrecv
+	for _, v := range attrs {
+		switch v {
+		case ModeSendrecv, ModeSendonly, ModeRecvonly, ModeInactive:
+			mode = v
+		}
+	}
+	return mode
 }
 
 // Unmarshal is non validate version of sdp parsing
